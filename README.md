@@ -4,23 +4,33 @@ OpenAI-compatible API bridge for [OpenCode](https://opencode.ai) free-tier model
 
 Exposes a local `/v1/chat/completions` endpoint that any OpenAI-compatible client (Cursor, VS Code, Continue, 9Router, etc.) can point to directly.
 
-## Models Available
+## Free Models Available
 
-| Model ID | Description |
-|---|---|
-| `muse-spark-1.3-contributor-free` | Muse Spark 1.3 (flagship free) |
-| `muse-spark-1.2-contributor-free` | Muse Spark 1.2 |
-| `deepseek-v4-flash-free` | DeepSeek V4 Flash |
-| `mimo-v2.5-free` | Xiaomi MiMo V2.5 |
-| `ling-3.0-flash-fin-free` | Ling 3.0 Flash |
-| `nemotron-3-ultra-free` | NVIDIA Nemotron 3 Ultra |
-| `nemotron-3.5-lightning-free` | NVIDIA Nemotron 3.5 Lightning |
+| Model ID | Provider / Description | Endpoint Protocol |
+|---|---|---|
+| `muse-spark-1.3-contributor-free` | Meta Muse Spark 1.3 Free (Flagship) | Responses API |
+| `muse-spark-1.2-contributor-free` | Meta Muse Spark 1.2 Free | Responses API |
+| `mimo-v2.6-flash-free` | Xiaomi MiMo V2.6 Flash Free | Chat Completions |
+| `nemotron-3.5-lightning-free` | NVIDIA Nemotron 3.5 Lightning Free | Chat Completions |
+| `ling-3.1-flash-free` | Ling 3.1 Flash Free | Chat Completions |
+| `space-bunny-free` | Space Bunny Preview Free | Chat Completions |
+| `cat-jam-free` | Cat Jam Free | Chat Completions |
+| `longcat-2.5-preview-free` | LongCat 2.5 Preview Free | Chat Completions |
+| `big-pickle` | Big Pickle Reasoning Free | Chat Completions |
 
-Aliases: `muse-spark`, `muse-spark-1.3`, `deepseek-v4-flash`, `mimo-v2.5` resolve to their free-tier equivalents automatically.
+### Aliases Supported
+The bridge automatically normalizes and redirects common aliases:
+- `muse-spark`, `muse-spark-1.3` $\rightarrow$ `muse-spark-1.3-contributor-free`
+- `mimo`, `mimo-v2.6`, `mimo-v2.5` $\rightarrow$ `mimo-v2.6-flash-free`
+- `nemotron`, `nemotron-3.5`, `nemotron-3-ultra` $\rightarrow$ `nemotron-3.5-lightning-free`
+- `ling`, `ling-3.1`, `ling-3.0-flash-fin-free` $\rightarrow$ `ling-3.1-flash-free`
+- `space-bunny` $\rightarrow$ `space-bunny-free`
+- `cat-jam` $\rightarrow$ `cat-jam-free`
+- `longcat` $\rightarrow$ `longcat-2.5-preview-free`
 
 ## Quick Start
 
-**Requirements:** Node.js ≥ 18 (no other dependencies)
+**Requirements:** Node.js ≥ 18 (stdlib only, zero dependencies)
 
 ```bash
 git clone https://github.com/azrinaldi/opencode-free-bridge
@@ -55,7 +65,7 @@ Add this as a custom `openai-compatible` provider in 9Router:
 - **API Key:** `public` (any value works)
 - **Prefix:** `zen`
 
-To add multiple bridge nodes (for redundancy/load distribution), add each as a separate connection pointing to its host IP and port `20129`.
+To add multiple bridge nodes (for redundancy/failover across different machines or residential IPs), add each node as a separate connection in 9Router.
 
 ## Usage with Any OpenAI Client
 
@@ -64,44 +74,22 @@ Set these in your client:
 ```
 Base URL: http://127.0.0.1:20129/v1
 API Key:  public
-Model:    muse-spark-1.3-contributor-free
+Model:    mimo-v2.6-flash-free (or any model from the table above)
 ```
 
-Works with streaming and non-streaming requests. Tool calling is supported.
+Supports both streaming (`stream: true`) and non-streaming (`stream: false`). Reasoning deltas (`reasoning_content`) are preserved for thinking models.
 
-## Run as a Service (systemd)
+## How It Works (Dual Routing Architecture)
 
-```ini
-# /etc/systemd/system/opencode-bridge.service
-[Unit]
-Description=OpenCode Free Bridge
-After=network-online.target
+OpenCode Zen gates its free tier through two separate upstream endpoints:
 
-[Service]
-Type=simple
-WorkingDirectory=/path/to/opencode-free-bridge
-ExecStart=/usr/bin/node server.js
-Restart=always
-RestartSec=3
-Environment=PORT=20129
-Environment=HOST=127.0.0.1
+1. **Responses API (`/zen/v1/responses`)**: Used natively by Meta Muse Spark models (`muse-spark-*`).
+2. **Chat Completions API (`/zen/v1/chat/completions`)**: Used by all other free models (`mimo`, `nemotron`, `ling`, `space-bunny`, `cat-jam`, etc.).
 
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-systemctl enable --now opencode-bridge
-```
-
-## How It Works
-
-The bridge translates OpenAI Chat Completions format to OpenCode's internal Responses API format, while impersonating the official desktop client (required by the free tier):
-
-1. **User-Agent spoofing** — sends the exact desktop app User-Agent string
-2. **Desktop headers** — `x-opencode-client: desktop`, session/request IDs in the expected format
-3. **Required tools injection** — free tier returns 403 without the 6 default desktop tools (`read`, `write`, `edit`, `bash`, `glob`, `grep`); bridge injects them as empty placeholders automatically
-4. **Streaming adapter** — upstream always streams (SSE); bridge buffers when client requests non-streaming
+The bridge automatically detects the model type and performs **Dual-Protocol Routing**:
+- **Anti-Abuse Bypass**: Injects the 6 mandatory desktop tools (`read`, `write`, `edit`, `bash`, `glob`, `grep`) into both endpoints to avoid 403 `FreeTierError`.
+- **Identity Impersonation**: Forwards authentic desktop client headers (`x-opencode-client: desktop`, session & request IDs, desktop User-Agent).
+- **Streaming Adaptor**: OpenCode upstream strictly enforces `stream: true` on free tier. The bridge always streams upstream, and buffers deltas automatically if the client requested a non-streaming response.
 
 ## License
 
