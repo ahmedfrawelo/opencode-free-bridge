@@ -318,7 +318,7 @@ const server = http.createServer(async (req, res) => {
       JSON.stringify({
         status: "ok",
         provider: "opencode-free-bridge",
-        version: "1.3.0",
+        version: "1.4.0",
         discoveredModels: activeModels.length,
       })
     );
