@@ -157,9 +157,9 @@ for _ in $(seq 1 20); do
 done
 
 echo
-say "Running self-check"
+say "Running self-check (quick — full check: node $BINDIR/verify.js)"
 echo
-PORT="$PORT" HOST="$HOST" node "$BINDIR/verify.js" || true
+PORT="$PORT" HOST="$HOST" node "$BINDIR/verify.js" --quick || true
 
 echo
 say "Done."
