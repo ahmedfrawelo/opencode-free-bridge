@@ -1,6 +1,7 @@
 const dns = require("dns");
 dns.setDefaultResultOrder("ipv4first");
 const http = require("http");
+const { effectiveMaxTokens } = require("./token-budget");
 const crypto = require("crypto");
 
 const PORT = parseInt(process.env.PORT || "20129", 10);
@@ -116,6 +117,24 @@ const MODEL_MAP = {
 
 // 6 default desktop tools required to satisfy OpenCode anti-abuse check
 const REQUIRED_TOOLS = ["read", "write", "edit", "bash", "glob", "grep"];
+
+// Reasoning models (Muse Spark, MiMo, Nemotron) burn tokens on chain-of-thought
+// before the first visible token. A client asking for max_tokens: 50 gets an
+// empty completion, because the budget is gone by the time the answer starts.
+// Enforce a floor so short requests still return content.
+const REASONING_MIN_TOKENS = 4096;
+// Non-reasoning models only need enough headroom to avoid a truncated answer.
+const CHAT_MIN_TOKENS = 256;
+
+// A request is treated as reasoning-bound when it targets a known thinking
+// model or the client explicitly asked for reasoning effort.
+const REASONING_MODEL_HINTS = ["muse", "mimo", "nemotron", "ling", "step-", "pickle"];
+function isReasoningRequest(body) {
+  const model = String(body?.model || "").toLowerCase();
+  if (REASONING_MODEL_HINTS.some((hint) => model.includes(hint))) return true;
+  const effort = body?.reasoning_effort;
+  return Boolean(effort) && effort !== "none";
+}
 
 function normalizeModel(rawModel) {
   let model = (rawModel || "muse-spark-1.3-contributor-free").replace(/^(opencode\/|oc\/|zen\/)/i, "");
@@ -337,7 +356,16 @@ const server = http.createServer(async (req, res) => {
             model: targetModel,
             input: transformToResponsesInput(body.messages),
             stream: true,
-            max_output_tokens: body.max_output_tokens || body.max_tokens || 131072,
+            // Muse Spark is a reasoning model: it spends ~100-250 tokens on
+            // chain-of-thought before emitting any output_text. When a client
+            // sends a small max_tokens (a probe, a title, a one-word answer),
+            // the upstream budget is exhausted by reasoning and the response
+            // completes with zero content. Raise the floor so the answer always
+            // has room to land.
+            max_output_tokens: Math.max(
+              body.max_output_tokens || body.max_tokens || 131072,
+              REASONING_MIN_TOKENS
+            ),
             tools: prepareResponsesTools(body.tools),
           };
         } else {
@@ -345,7 +373,13 @@ const server = http.createServer(async (req, res) => {
             model: targetModel,
             messages: body.messages || [],
             stream: true,
-            max_tokens: body.max_tokens || body.max_output_tokens || 131072,
+            // Same floor for the Chat Completions lane: MiMo and Nemotron also
+            // emit reasoning tokens first. Non-reasoning models keep the client
+            // value untouched apart from a small safety minimum.
+            max_tokens: Math.max(
+              body.max_tokens || body.max_output_tokens || 131072,
+              isReasoningRequest(body) ? REASONING_MIN_TOKENS : CHAT_MIN_TOKENS
+            ),
             tools: prepareChatTools(body.tools),
           };
         }
