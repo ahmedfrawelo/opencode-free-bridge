@@ -36,12 +36,10 @@ function createId(descending, timestamp = Date.now()) {
   return time + randomStr;
 }
 
-// --- Model Registry & Aliases ---
+// --- Model Registry (Clean Canonical Free Models Only) ---
 const MODELS = [
-  // Responses API (Meta Muse Spark)
   { id: "muse-spark-1.3-contributor-free", object: "model", owned_by: "opencode" },
   { id: "muse-spark-1.2-contributor-free", object: "model", owned_by: "opencode" },
-  // Chat Completions API (Xiaomi, NVIDIA, Ling, TypeSafe, etc.)
   { id: "mimo-v2.6-flash-free",          object: "model", owned_by: "opencode" },
   { id: "nemotron-3.5-lightning-free",   object: "model", owned_by: "opencode" },
   { id: "ling-3.1-flash-free",           object: "model", owned_by: "opencode" },
@@ -49,17 +47,6 @@ const MODELS = [
   { id: "cat-jam-free",                  object: "model", owned_by: "opencode" },
   { id: "longcat-2.5-preview-free",      object: "model", owned_by: "opencode" },
   { id: "big-pickle",                    object: "model", owned_by: "opencode" },
-  // Common Aliases
-  { id: "muse-spark-1.3",                object: "model", owned_by: "opencode" },
-  { id: "muse-spark",                    object: "model", owned_by: "opencode" },
-  { id: "mimo-v2.6",                     object: "model", owned_by: "opencode" },
-  { id: "mimo-v2.5",                     object: "model", owned_by: "opencode" },
-  { id: "nemotron-3.5",                  object: "model", owned_by: "opencode" },
-  { id: "nemotron-3-ultra",              object: "model", owned_by: "opencode" },
-  { id: "ling-3.1",                      object: "model", owned_by: "opencode" },
-  { id: "space-bunny",                   object: "model", owned_by: "opencode" },
-  { id: "cat-jam",                       object: "model", owned_by: "opencode" },
-  { id: "longcat-2.5",                   object: "model", owned_by: "opencode" },
 ];
 
 const MODEL_MAP = {
