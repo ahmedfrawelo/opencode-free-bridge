@@ -1,0 +1,14 @@
+{
+  "name": "opencode-free-bridge",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible bridge to OpenCode free-tier models (no account required)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["opencode", "openai", "bridge", "proxy", "free", "llm"],
+  "license": "MIT"
+}
