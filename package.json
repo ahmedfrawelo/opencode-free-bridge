@@ -1,14 +1,37 @@
 {
   "name": "opencode-free-bridge",
-  "version": "1.0.0",
+  "version": "1.4.0",
   "description": "OpenAI-compatible bridge to OpenCode free-tier models (no account required)",
   "main": "server.js",
+  "bin": {
+    "opencode-free-bridge": "server.js"
+  },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "verify": "node verify.js",
+    "test": "node verify.js --quick"
   },
   "engines": {
     "node": ">=18.0.0"
   },
-  "keywords": ["opencode", "openai", "bridge", "proxy", "free", "llm"],
+  "files": [
+    "server.js",
+    "token-budget.js",
+    "verify.js",
+    "install.sh",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "openai",
+    "bridge",
+    "proxy",
+    "free",
+    "llm",
+    "9router",
+    "cursor",
+    "continue",
+    "vscode"
+  ],
   "license": "MIT"
 }
