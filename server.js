@@ -8,6 +8,7 @@ const HOST = process.env.HOST || "127.0.0.1";
 
 const OPENCODE_ZEN_RESPONSES_URL = "https://opencode.ai/zen/v1/responses";
 const OPENCODE_ZEN_CHAT_URL = "https://opencode.ai/zen/v1/chat/completions";
+const OPENCODE_ZEN_MODELS_URL = "https://opencode.ai/zen/v1/models";
 const USER_AGENT = "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
 
 // --- ID Generator (matches OpenCode desktop app format) ---
@@ -36,8 +37,8 @@ function createId(descending, timestamp = Date.now()) {
   return time + randomStr;
 }
 
-// --- Model Registry (Clean Canonical Free Models Only) ---
-const MODELS = [
+// --- Known Fallback Models ---
+const FALLBACK_MODELS = [
   { id: "muse-spark-1.3-contributor-free", object: "model", owned_by: "opencode" },
   { id: "muse-spark-1.2-contributor-free", object: "model", owned_by: "opencode" },
   { id: "mimo-v2.6-flash-free",          object: "model", owned_by: "opencode" },
@@ -49,6 +50,47 @@ const MODELS = [
   { id: "big-pickle",                    object: "model", owned_by: "opencode" },
 ];
 
+let activeModels = [...FALLBACK_MODELS];
+let lastDiscoveryTime = 0;
+const DISCOVERY_TTL_MS = 60 * 60 * 1000; // Auto-refresh every 1 hour
+
+// Auto-discovery from OpenCode Zen upstream gateway
+async function discoverModels() {
+  try {
+    const res = await fetch(OPENCODE_ZEN_MODELS_URL, {
+      headers: {
+        "Authorization": "Bearer public",
+        "User-Agent": USER_AGENT,
+      },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    const items = json.data || [];
+
+    const freeItems = items
+      .filter((item) => {
+        const id = (item.id || "").toLowerCase();
+        if (id.startsWith("jev-")) return false; // Exclude systemone evaluator models
+        return id.endsWith("-free") || id.includes("-contributor") || id === "big-pickle";
+      })
+      .map((item) => ({
+        id: item.id,
+        object: "model",
+        owned_by: item.owned_by || "opencode",
+      }));
+
+    if (freeItems.length > 0) {
+      activeModels = freeItems;
+      lastDiscoveryTime = Date.now();
+      console.log(`[opencode-bridge] Auto-discovered ${activeModels.length} free models from upstream gateway.`);
+      return;
+    }
+  } catch (err) {
+    console.warn(`[opencode-bridge] Auto-discovery warning: ${err.message}. Using cached/fallback models.`);
+  }
+}
+
+// Internal alias normalizer for common shorthand requests
 const MODEL_MAP = {
   "muse-spark":                 "muse-spark-1.3-contributor-free",
   "muse-spark-1.3":             "muse-spark-1.3-contributor-free",
@@ -81,7 +123,7 @@ function normalizeModel(rawModel) {
 }
 
 function isResponsesModel(modelId) {
-  return modelId.startsWith("muse-spark");
+  return modelId.toLowerCase().includes("muse");
 }
 
 function extractContent(content) {
@@ -253,13 +295,23 @@ const server = http.createServer(async (req, res) => {
   // Health check
   if (pathname === "" || pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ status: "ok", provider: "opencode-free-bridge", version: "1.2.0" }));
+    return res.end(
+      JSON.stringify({
+        status: "ok",
+        provider: "opencode-free-bridge",
+        version: "1.3.0",
+        discoveredModels: activeModels.length,
+      })
+    );
   }
 
-  // Model list
+  // Model list (triggers async auto-discovery if cache expired)
   if (req.method === "GET" && (pathname === "/v1/models" || pathname === "/models")) {
+    if (Date.now() - lastDiscoveryTime > DISCOVERY_TTL_MS) {
+      discoverModels().catch(() => {});
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ object: "list", data: MODELS }));
+    return res.end(JSON.stringify({ object: "list", data: activeModels }));
   }
 
   // Chat completions
@@ -535,7 +587,8 @@ const server = http.createServer(async (req, res) => {
                     if (ev.item.id) nonStreamToolMap.set(ev.item.id, tc);
                     if (ev.output_index !== undefined) nonStreamToolMap.set(String(ev.output_index), tc);
                   } else if (ev.type === "response.function_call_arguments.delta" && ev.delta) {
-                    const key = ev.output_index !== undefined ? String(ev.output_index) : ev.item_id || ev.call_id;
+                    const key =
+                      ev.output_index !== undefined ? String(ev.output_index) : ev.item_id || ev.call_id;
                     const targetTc =
                       key !== undefined && nonStreamToolMap.has(key)
                         ? nonStreamToolMap.get(key)
@@ -614,6 +667,11 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ error: { message: "Not found", type: "invalid_request_error" } }));
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`[opencode-free-bridge] Listening on http://${HOST}:${PORT}`);
+// Initial auto-discovery on startup & hourly interval
+discoverModels().finally(() => {
+  server.listen(PORT, HOST, () => {
+    console.log(`[opencode-free-bridge] Listening on http://${HOST}:${PORT}`);
+  });
 });
+
+setInterval(discoverModels, DISCOVERY_TTL_MS);

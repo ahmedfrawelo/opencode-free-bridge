@@ -4,9 +4,17 @@ OpenAI-compatible API bridge for [OpenCode](https://opencode.ai) free-tier model
 
 Exposes a local `/v1/chat/completions` endpoint that any OpenAI-compatible client (Cursor, VS Code, Continue, 9Router, etc.) can point to directly.
 
-## Free Models Available
+## Features
 
-| Model ID | Provider / Description | Endpoint Protocol |
+- **Automatic Model Discovery**: Automatically fetches and maintains the latest list of 100% free models directly from the upstream OpenCode Zen gateway on startup and hourly in the background. No manual updates needed when new free models are released.
+- **Dual-Protocol Routing**: Intelligently routes Meta Muse models to the Responses API (`/zen/v1/responses`) and all other models to the Chat Completions API (`/zen/v1/chat/completions`).
+- **Anti-Abuse Bypass**: Injects required desktop tools and official identity headers (`Bearer public`, session & request IDs) to avoid 403 `FreeTierError`.
+- **Reasoning Content Support**: Thinking models (MiMo, Nemotron, etc.) preserve reasoning tokens inside `reasoning_content` in both streaming and non-streaming modes.
+- **Resilient Fallback**: Falls back to cached/built-in models if the upstream catalog is temporarily unreachable.
+
+## Currently Active Free Models (Auto-Discovered)
+
+| Model ID | Provider / Description | Upstream Protocol |
 |---|---|---|
 | `muse-spark-1.3-contributor-free` | Meta Muse Spark 1.3 Free (Flagship) | Responses API |
 | `muse-spark-1.2-contributor-free` | Meta Muse Spark 1.2 Free | Responses API |
@@ -18,15 +26,7 @@ Exposes a local `/v1/chat/completions` endpoint that any OpenAI-compatible clien
 | `longcat-2.5-preview-free` | LongCat 2.5 Preview Free | Chat Completions |
 | `big-pickle` | Big Pickle Reasoning Free | Chat Completions |
 
-### Aliases Supported
-The bridge automatically normalizes and redirects common aliases:
-- `muse-spark`, `muse-spark-1.3` $\rightarrow$ `muse-spark-1.3-contributor-free`
-- `mimo`, `mimo-v2.6`, `mimo-v2.5` $\rightarrow$ `mimo-v2.6-flash-free`
-- `nemotron`, `nemotron-3.5`, `nemotron-3-ultra` $\rightarrow$ `nemotron-3.5-lightning-free`
-- `ling`, `ling-3.1`, `ling-3.0-flash-fin-free` $\rightarrow$ `ling-3.1-flash-free`
-- `space-bunny` $\rightarrow$ `space-bunny-free`
-- `cat-jam` $\rightarrow$ `cat-jam-free`
-- `longcat` $\rightarrow$ `longcat-2.5-preview-free`
+*When OpenCode introduces new free models, they will automatically appear in `/v1/models` without needing any code updates.*
 
 ## Quick Start
 
@@ -65,7 +65,7 @@ Add this as a custom `openai-compatible` provider in 9Router:
 - **API Key:** `public` (any value works)
 - **Prefix:** `zen`
 
-To add multiple bridge nodes (for redundancy/failover across different machines or residential IPs), add each node as a separate connection in 9Router.
+Click **"Import from /models endpoint"** in 9Router to sync the active free models.
 
 ## Usage with Any OpenAI Client
 
@@ -77,19 +77,7 @@ API Key:  public
 Model:    mimo-v2.6-flash-free (or any model from the table above)
 ```
 
-Supports both streaming (`stream: true`) and non-streaming (`stream: false`). Reasoning deltas (`reasoning_content`) are preserved for thinking models.
-
-## How It Works (Dual Routing Architecture)
-
-OpenCode Zen gates its free tier through two separate upstream endpoints:
-
-1. **Responses API (`/zen/v1/responses`)**: Used natively by Meta Muse Spark models (`muse-spark-*`).
-2. **Chat Completions API (`/zen/v1/chat/completions`)**: Used by all other free models (`mimo`, `nemotron`, `ling`, `space-bunny`, `cat-jam`, etc.).
-
-The bridge automatically detects the model type and performs **Dual-Protocol Routing**:
-- **Anti-Abuse Bypass**: Injects the 6 mandatory desktop tools (`read`, `write`, `edit`, `bash`, `glob`, `grep`) into both endpoints to avoid 403 `FreeTierError`.
-- **Identity Impersonation**: Forwards authentic desktop client headers (`x-opencode-client: desktop`, session & request IDs, desktop User-Agent).
-- **Streaming Adaptor**: OpenCode upstream strictly enforces `stream: true` on free tier. The bridge always streams upstream, and buffers deltas automatically if the client requested a non-streaming response.
+Supports both streaming (`stream: true`) and non-streaming (`stream: false`).
 
 ## License
 
