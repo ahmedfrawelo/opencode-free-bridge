@@ -50,23 +50,10 @@ fetch() {
   fi
 }
 
+fetch package.json
 fetch server.js
 fetch token-budget.js
 fetch verify.js
-
-# The bridge is stdlib-only, but keep a package.json so `npm start` works too.
-cat > "$BINDIR/package.json" <<JSON
-{
-  "name": "opencode-free-bridge",
-  "version": "1.4.0",
-  "private": true,
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "verify": "node verify.js"
-  }
-}
-JSON
 say "Files installed"
 
 # ---------------------------------------------------------------- service ---

@@ -63,9 +63,22 @@ function isReasoningRequest(body, modelId) {
 // Clamp the client's requested budget into a range that always leaves room for
 // a visible answer. The client's value is never lowered — only raised when it
 // is too small to survive the model's reasoning phase.
-function effectiveMaxTokens(requested, modelId, body) {
+function parseRequestedTokens(requested) {
+  if (requested === undefined || requested === null || typeof requested === "boolean") {
+    return MAX_OUTPUT_TOKENS;
+  }
+  if (typeof requested === "string" && requested.trim() === "") {
+    return MAX_OUTPUT_TOKENS;
+  }
   const raw = Number(requested);
-  const wanted = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : MAX_OUTPUT_TOKENS;
+  if (!Number.isFinite(raw) || raw < 0) {
+    return MAX_OUTPUT_TOKENS;
+  }
+  return Math.floor(raw);
+}
+
+function effectiveMaxTokens(requested, modelId, body) {
+  const wanted = parseRequestedTokens(requested);
 
   const effective = isReasoningRequest(body, modelId)
     ? Math.max(wanted, MIN_ANSWER_TOKENS) + THINKING_BUDGET

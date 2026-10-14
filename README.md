@@ -42,30 +42,34 @@ node server.js
 
 The bridge listens on `http://127.0.0.1:20129` by default.
 
-## Verify
+## Test & Verify
 
 ```bash
-node verify.js          # every model, real prompt
-node verify.js --quick  # one short probe per model
+npm test                # offline unit & HTTP contract tests (no network)
+node verify.js          # live check: every model, real prompt
+node verify.js --quick  # live check: one short probe per model
 ```
 
 ```
-  OK  bridge v1.4.0, 10 free models discovered
+  OK  bridge v1.5.0, 9 free models discovered
 
-  Probing 10 models (quick)...
+  Probing 9 models (quick)...
 
-  OK   big-pickle                             1.9s  2 chars, 20 tokens
-  BUSY ling-3.1-flash-free                    0.7s  upstream rate limit, retry later
-  OK   cat-jam-free                           0.6s  2 chars, 27 tokens
-  ...
-  OK   space-bunny-free                       1.0s  2 chars, 31 tokens
+  OK   big-pickle                             1.5s  2 chars, 2 tokens
+  OK   cat-jam-free                           1.0s  2 chars, 30 tokens
+  OK   mimo-v2.6-flash-free                   2.8s  2 chars, 16 tokens
+  OK   muse-spark-1.2-contributor-free        1.7s  2 chars, 156 tokens
+  OK   muse-spark-1.3-contributor-free        1.4s  2 chars, 160 tokens
+  OK   nemotron-3.5-lightning-free            2.9s  2 chars, 33 tokens
+  OK   step-5-preview-free                    1.5s  2 chars, 18 tokens
+  OK   longcat-2.5-preview-free               2.6s  2 chars, 23 tokens
+  OK   space-bunny-free                       1.6s  2 chars, 23 tokens
 
 Summary
-  8 usable, 2 rate-limited, 0 not answering
+  9 usable, 0 rate-limited, 0 not answering
 ```
 
 `BUSY` indicates upstream throttling for the current IP, not a configuration problem.
-
 ## Usage
 
 | Setting | Value |
@@ -169,7 +173,8 @@ Then register `http://127.0.0.1:20130/v1` as an additional connection.
 |---|---|---|
 | `PORT` | `20129` | Listen port |
 | `HOST` | `127.0.0.1` | Bind address. Set to `0.0.0.0` to expose on the network — only behind a firewall, the endpoint has no authentication. |
-
+| `UPSTREAM_TIMEOUT_MS` | `120000` | Upstream request timeout in milliseconds |
+| `MAX_BODY_BYTES` | `10485760` | Maximum request payload size in bytes (10 MiB) |
 ## Troubleshooting
 
 **All models report `BUSY`**
@@ -199,15 +204,15 @@ node ~/.opencode-free-bridge/server.js
 ## How it works
 
 ```
-client ──▶ bridge :20129 ──▶ opencode.ai/zen/v1/...
+client ──▶ bridge :20129 ──▶ opencode.ai/inference/v1/...
               │
-              ├─ discovers free models hourly
-              ├─ routes Muse models to the Responses API
-              ├─ routes everything else to Chat Completions
-              ├─ raises max_tokens for reasoning models
-              └─ normalizes reasoning into reasoning_content
+              ├─ discovers free models & latest CLI version hourly
+              ├─ routes Responses models to /inference/v1/responses (auto-learns on protocol mismatch)
+              ├─ routes Chat models to /inference/v1/chat/completions
+              ├─ injects canonical v2 tool/session fingerprints with client tool aliasing
+              ├─ applies additive token budget floor for reasoning models
+              └─ normalizes reasoning into reasoning_content and propagates usage & finish_reason
 ```
-
 The bridge always streams from upstream and reassembles for non-streaming
 clients, keeping a single code path for both.
 

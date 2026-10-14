@@ -1,5 +1,56 @@
 # Changelog
 
+## [1.5.0] — 2026-10-14
+
+### Fixed — OpenCode v2 `/inference/v1` gate migration (`403 FreeTierError`, 9router#4837)
+
+OpenCode v2 migrated free-tier inference from `/zen/v1/*` to `/inference/v1/*`
+and added multi-layer request verification:
+
+- **Endpoints**: moved responses, chat completions, and model discovery to
+  `https://opencode.ai/inference/v1/{responses,chat/completions,models}`.
+- **User-Agent**: updated to the v2 CLI format (`opencode/latest/2.0.29/cli`)
+  with automatic version refresh from the upstream GitHub release Atom feed.
+- **Session headers & counter gate**: sends the required session header mirrors
+  (`x-opencode-session`, `x-opencode-session-id`, `x-session-affinity`,
+  `x-session-id`), removes `x-opencode-request` (rejected by v2), and clamps the
+  12-bit inverted session counter to `1..16` per millisecond in `createId`.
+- **Canonical tool fingerprint & conflict aliasing**: injects verbatim `read`
+  and `shell` schemas required by upstream, omits `tool_choice: "none"`,
+  aliases conflicting client `read`/`shell` tools (`read_client`,
+  `shell_client`) with transparent response restoration, and appends a
+  placeholder system instruction so injected fingerprint tools are not invoked.
+
+### Fixed — token budget, `usage`, and `finish_reason`
+
+- **Unified additive token budget**: `server.js` now calls
+  `effectiveMaxTokens` from `token-budget.js` (`max(requested, 1024) + 4096` for
+  reasoning models including `longcat-2.5-preview-free` and `cat-jam-free`),
+  removing the duplicate flat `Math.max` logic and handling `max_tokens: 0` and
+  numeric strings without jumping to `131072`.
+- **Non-streaming `usage` in Chat Completions**: sends
+  `stream_options: { include_usage: true }` upstream so `prompt_tokens`,
+  `completion_tokens`, and `total_tokens` are populated instead of `{0, 0, 0}`.
+- **Real `finish_reason` propagation**: propagates upstream `finish_reason`
+  (`"length"`, `"content_filter"`, `"tool_calls"`, `"stop"`) across both Chat
+  Completions and Responses API (`response.incomplete`).
+
+### Changed — reliability, validation, and unit test suite
+
+- Added `AbortController` upstream timeout (`UPSTREAM_TIMEOUT_MS`, default 120s),
+  automatic upstream cancellation on client disconnect, and `req`/`res` stream
+  error handlers.
+- Added 10 MiB request body limit (`413 payload_too_large`) and `400` validation
+  for missing/empty `model`, missing `messages`, or malformed JSON.
+- Fixed `sessionCache` eviction to true $O(1)$ LRU instead of FIFO.
+- Single-sourced `VERSION` from `package.json` in `server.js` and `install.sh`.
+- Added automatic protocol fallback & caching when upstream returns
+  `400 ModelProtocolUnsupported`.
+- Added zero-network unit & HTTP integration tests (`npm test` via `node:test`)
+  and GitHub Actions CI (`.github/workflows/ci.yml`).
+
+---
+
 ## [1.4.0] — 2026-10-13
 
 ### Fixed — reasoning models returned empty answers on short requests

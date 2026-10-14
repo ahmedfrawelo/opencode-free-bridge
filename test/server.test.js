@@ -1,0 +1,353 @@
+const { describe, it, before, after, beforeEach } = require("node:test");
+const assert = require("node:assert/strict");
+const http = require("node:http");
+const pkg = require("../package.json");
+const {
+  VERSION,
+  MAX_SESSIONS,
+  sessionCache,
+  createId,
+  normalizeModel,
+  isResponsesModel,
+  markProtocolSupport,
+  buildUpstreamHeaders,
+  buildUpstreamPayload,
+  getPersistentSessionId,
+  server,
+} = require("../server");
+
+function sseStreamFromLines(lines) {
+  const encoder = new TextEncoder();
+  return new ReadableStream({
+    start(controller) {
+      for (const line of lines) {
+        controller.enqueue(encoder.encode(line));
+      }
+      controller.close();
+    },
+  });
+}
+
+function httpRequest(port, method, path, body, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const payload =
+      body === undefined
+        ? null
+        : typeof body === "string"
+          ? body
+          : JSON.stringify(body);
+    const req = http.request(
+      {
+        host: "127.0.0.1",
+        port,
+        path,
+        method,
+        headers: {
+          ...(payload !== null
+            ? {
+                "Content-Type": "application/json",
+                "Content-Length": Buffer.byteLength(payload),
+              }
+            : {}),
+          ...headers,
+        },
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => {
+          let json = null;
+          try {
+            json = JSON.parse(data);
+          } catch {}
+          resolve({ status: res.statusCode, body: json, raw: data });
+        });
+      }
+    );
+    req.on("error", reject);
+    if (payload !== null) req.write(payload);
+    req.end();
+  });
+}
+
+describe("server unit & integration tests", () => {
+  beforeEach(() => {
+    sessionCache.clear();
+  });
+
+  it("keeps VERSION synced with package.json", () => {
+    assert.equal(VERSION, pkg.version);
+  });
+
+  it("normalizeModel rejects empty/missing models and strips provider prefixes", () => {
+    assert.equal(normalizeModel(undefined), "");
+    assert.equal(normalizeModel(null), "");
+    assert.equal(normalizeModel(""), "");
+    assert.equal(normalizeModel("   "), "");
+    assert.equal(normalizeModel("oc/"), "");
+    assert.equal(normalizeModel("zen/mimo"), "mimo-v2.6-flash-free");
+    assert.equal(normalizeModel("opencode/longcat"), "longcat-2.5-preview-free");
+    assert.equal(normalizeModel("cat-jam"), "cat-jam-free");
+  });
+
+  it("createId never overflows the 12-bit counter into timestamp bits and keeps counter <= 16", () => {
+    const ts = 1_760_000_000_000;
+    const seen = new Set();
+    for (let i = 0; i < 64; i++) {
+      const id = createId(true, ts);
+      assert.match(id, /^[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+      seen.add(id);
+      const invertedPrefix = BigInt(`0x${id.slice(0, 12)}`);
+      const decoded = ~invertedPrefix & ((1n << 48n) - 1n);
+      const counterBits = Number(decoded & 0xfffn);
+      const decodedTs = decoded >> 12n;
+      const expectedTs36 = BigInt(ts + Math.floor(i / 16)) & ((1n << 36n) - 1n);
+      assert.ok(counterBits >= 1 && counterBits <= 16, `counter ${counterBits} out of 1..16`);
+      assert.equal(decodedTs, expectedTs36);
+    }
+    assert.equal(seen.size, 64);
+  });
+
+  it("getPersistentSessionId evicts least-recently-used (LRU) session instead of FIFO", () => {
+    for (let i = 0; i < MAX_SESSIONS; i++) {
+      getPersistentSessionId({ headers: { "x-session-id": `s-${i}` } }, {});
+    }
+    assert.equal(sessionCache.size, MAX_SESSIONS);
+
+    // Touch s-0 so it becomes most-recently-used; s-1 is now LRU
+    const s0Before = getPersistentSessionId({ headers: { "x-session-id": "s-0" } }, {});
+    // Insert a new session beyond capacity
+    getPersistentSessionId({ headers: { "x-session-id": "s-new" } }, {});
+
+    assert.equal(sessionCache.has("hdr:s-0"), true, "Touched session s-0 must not be evicted");
+    assert.equal(sessionCache.has("hdr:s-1"), false, "Oldest untouched session s-1 must be evicted");
+    const s0After = getPersistentSessionId({ headers: { "x-session-id": "s-0" } }, {});
+    assert.equal(s0After, s0Before);
+  });
+
+  it("buildUpstreamHeaders and buildUpstreamPayload satisfy OpenCode v2 /inference/v1 gate", () => {
+    const sessionId = "ses_" + createId(true);
+    const headers = buildUpstreamHeaders({ headers: { "user-agent": "OpenAI/Python" } }, sessionId);
+    assert.match(headers["User-Agent"], /^opencode\/latest\/\d+\.\d+\.\d+\/cli$/);
+    assert.equal(headers["x-opencode-client"], "cli");
+    assert.equal(headers["x-opencode-session"], sessionId);
+    assert.equal(headers["x-opencode-session-id"], sessionId);
+    assert.equal(headers["x-session-affinity"], sessionId);
+    assert.equal(headers["x-session-id"], sessionId);
+    assert.equal("x-opencode-request" in headers, false);
+
+    // Chat payload with client 'read' tool conflict + max_tokens: 50 on longcat
+    const { upstreamBody, aliasToOriginal } = buildUpstreamPayload(
+      {
+        model: "longcat-2.5-preview-free",
+        max_tokens: 50,
+        tool_choice: "none",
+        messages: [{ role: "user", content: "hi" }],
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "read",
+              description: "Custom client read tool",
+              parameters: { type: "object", properties: { file: { type: "string" } } },
+            },
+          },
+        ],
+      },
+      "longcat-2.5-preview-free",
+      false
+    );
+
+    // Additive budget: max(50, 1024) + 4096 = 5120
+    assert.equal(upstreamBody.max_tokens, 5120);
+    assert.deepEqual(upstreamBody.stream_options, { include_usage: true });
+    assert.equal("tool_choice" in upstreamBody, false, "tool_choice: 'none' must be omitted");
+
+    const toolNames = upstreamBody.tools.map((t) => t.function.name);
+    assert.deepEqual(toolNames, ["read_client", "read", "shell"]);
+    assert.equal(aliasToOriginal.get("read_client"), "read");
+  });
+
+  describe("HTTP endpoint behavior (mocked upstream fetch)", () => {
+    let port;
+    let originalFetch;
+    let mockFetchImpl;
+
+    before(async () => {
+      originalFetch = global.fetch;
+      global.fetch = async (...args) => mockFetchImpl(...args);
+      await new Promise((resolve) => {
+        server.listen(0, "127.0.0.1", () => {
+          port = server.address().port;
+          resolve();
+        });
+      });
+    });
+
+    after(async () => {
+      global.fetch = originalFetch;
+      await new Promise((resolve) => server.close(resolve));
+    });
+
+    it("returns 400 when model is missing or empty, and 400 on invalid JSON", async () => {
+      const rMissing = await httpRequest(port, "POST", "/v1/chat/completions", {
+        messages: [{ role: "user", content: "hi" }],
+      });
+      assert.equal(rMissing.status, 400);
+      assert.equal(rMissing.body.error.code, "model_required");
+
+      const rEmpty = await httpRequest(port, "POST", "/v1/chat/completions", {
+        model: "   ",
+        messages: [{ role: "user", content: "hi" }],
+      });
+      assert.equal(rEmpty.status, 400);
+      assert.equal(rEmpty.body.error.code, "model_required");
+
+      const rBadJson = await httpRequest(port, "POST", "/v1/chat/completions", "{bad json");
+      assert.equal(rBadJson.status, 400);
+      assert.equal(rBadJson.body.error.code, "invalid_json");
+    });
+
+    it("propagates real usage and finish_reason='length' in non-streaming Chat Completions", async () => {
+      let capturedBody = null;
+      mockFetchImpl = async (_url, init) => {
+        capturedBody = JSON.parse(init.body);
+        return {
+          ok: true,
+          status: 200,
+          body: sseStreamFromLines([
+            'data: {"choices":[{"index":0,"delta":{"reasoning":"thinking...","content":"partial answer"},"finish_reason":null}],"usage":null}\n\n',
+            'data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}],"usage":null}\n\n',
+            'data: {"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":512,"total_tokens":632}}\n\n',
+            "data: [DONE]\n\n",
+          ]),
+        };
+      };
+
+      const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+        model: "cat-jam-free",
+        max_tokens: 0,
+        stream: false,
+        messages: [{ role: "user", content: "Tell a story" }],
+      });
+
+      assert.equal(res.status, 200);
+      assert.equal(capturedBody.max_tokens, 5120);
+      assert.deepEqual(capturedBody.stream_options, { include_usage: true });
+      assert.equal(res.body.choices[0].message.content, "partial answer");
+      assert.equal(res.body.choices[0].message.reasoning_content, "thinking...");
+      assert.equal(res.body.choices[0].finish_reason, "length");
+      assert.deepEqual(res.body.usage, {
+        prompt_tokens: 120,
+        completion_tokens: 512,
+        total_tokens: 632,
+      });
+    });
+
+    it("propagates finish_reason='length' on Responses API incomplete and restores aliased client tool names", async () => {
+      mockFetchImpl = async () => ({
+        ok: true,
+        status: 200,
+        body: sseStreamFromLines([
+          'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","call_id":"call_abc","type":"function_call","name":"read_client"}}\n\n',
+          'data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\\"file\\":\\"a.txt\\"}"}\n\n',
+          'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":50,"output_tokens":15,"total_tokens":65}}}\n\n',
+        ]),
+      });
+
+      const toolRes = await httpRequest(port, "POST", "/v1/chat/completions", {
+        model: "muse-spark-1.3-contributor-free",
+        stream: false,
+        messages: [{ role: "user", content: "read a.txt" }],
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "read",
+              description: "client read",
+              parameters: { type: "object", properties: { file: { type: "string" } } },
+            },
+          },
+        ],
+      });
+
+      assert.equal(toolRes.status, 200);
+      assert.equal(toolRes.body.choices[0].finish_reason, "tool_calls");
+      assert.equal(toolRes.body.choices[0].message.tool_calls[0].function.name, "read");
+      assert.equal(
+        toolRes.body.choices[0].message.tool_calls[0].function.arguments,
+        '{"file":"a.txt"}'
+      );
+      assert.deepEqual(toolRes.body.usage, {
+        prompt_tokens: 50,
+        completion_tokens: 15,
+        total_tokens: 65,
+      });
+
+      // Now test response.incomplete -> finish_reason: "length"
+      mockFetchImpl = async () => ({
+        ok: true,
+        status: 200,
+        body: sseStreamFromLines([
+          'data: {"type":"response.output_text.delta","delta":"truncated"}\n\n',
+          'data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":100,"total_tokens":110}}}\n\n',
+        ]),
+      });
+
+      const truncRes = await httpRequest(port, "POST", "/v1/chat/completions", {
+        model: "muse-spark-1.3-contributor-free",
+        stream: false,
+        messages: [{ role: "user", content: "long text" }],
+      });
+      assert.equal(truncRes.status, 200);
+      assert.equal(truncRes.body.choices[0].finish_reason, "length");
+      assert.equal(truncRes.body.choices[0].message.content, "truncated");
+    });
+
+    it("automatically retries on the opposite protocol lane when upstream returns ModelProtocolUnsupported", async () => {
+      const urlsCalled = [];
+      mockFetchImpl = async (url) => {
+        urlsCalled.push(url);
+        if (url.endsWith("/chat/completions")) {
+          return {
+            ok: false,
+            status: 400,
+            text: async () =>
+              JSON.stringify({
+                type: "error",
+                error: {
+                  type: "ModelProtocolUnsupported",
+                  message: "Model does not support this protocol.",
+                },
+              }),
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: sseStreamFromLines([
+            'data: {"type":"response.output_text.delta","delta":"OK from responses"}\n\n',
+            'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}}}\n\n',
+          ]),
+        };
+      };
+
+      const newModel = "future-responses-model-free";
+      assert.equal(isResponsesModel(newModel), false);
+
+      const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+        model: newModel,
+        stream: false,
+        messages: [{ role: "user", content: "hi" }],
+      });
+
+      assert.equal(res.status, 200);
+      assert.equal(res.body.choices[0].message.content, "OK from responses");
+      assert.equal(urlsCalled.length, 2);
+      assert.match(urlsCalled[0], /\/inference\/v1\/chat\/completions$/);
+      assert.match(urlsCalled[1], /\/inference\/v1\/responses$/);
+      assert.equal(isResponsesModel(newModel), true);
+      markProtocolSupport(newModel, false);
+    });
+  });
+});
