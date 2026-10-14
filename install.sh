@@ -41,20 +41,23 @@ say "Installing into $BINDIR"
 
 fetch() {
   local file="$1"
+  local tmp="$BINDIR/.$file.tmp.$$"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 3 -o "$BINDIR/$file" "$RAW/$file"
+    curl -fsSL --retry 3 -o "$tmp" "$RAW/$file"
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$BINDIR/$file" "$RAW/$file"
+    wget -qO "$tmp" "$RAW/$file"
   else
     die "neither curl nor wget is available"
   fi
+  mv -f "$tmp" "$BINDIR/$file"
 }
 
 fetch package.json
 fetch server.js
 fetch token-budget.js
 fetch verify.js
-say "Files installed"
+chmod +x "$BINDIR/server.js" "$BINDIR/verify.js" 2>/dev/null || true
+say "Files installed (v$(node -p "require('$BINDIR/package.json').version" 2>/dev/null || echo 'latest'))"
 
 # ---------------------------------------------------------------- service ---
 install_service() {
@@ -64,11 +67,8 @@ install_service() {
   if [ "$os" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
     local unit_dir="/etc/systemd/system"
     local unit="$unit_dir/opencode-free-bridge.service"
-    if [ ! -w "$unit_dir" ]; then
-      warn "no write access to $unit_dir — skipping service install (run with sudo to enable it)"
-      return 1
-    fi
-    cat > "$unit" <<UNIT
+    if [ -w "$unit_dir" ]; then
+      cat > "$unit" <<UNIT
 [Unit]
 Description=OpenCode Free Bridge (OpenAI-compatible, free-tier models)
 After=network-online.target
@@ -80,6 +80,7 @@ User=$(id -un)
 WorkingDirectory=$BINDIR
 Environment=PORT=$PORT
 Environment=HOST=$HOST
+Environment=AUTO_UPDATE=1
 ExecStart=$(command -v node) $BINDIR/server.js
 Restart=always
 RestartSec=3
@@ -88,11 +89,42 @@ MemoryMax=512M
 [Install]
 WantedBy=multi-user.target
 UNIT
-    systemctl daemon-reload
-    systemctl enable opencode-free-bridge >/dev/null 2>&1 || true
-    systemctl restart opencode-free-bridge
-    say "systemd service installed and started"
-    return 0
+      systemctl daemon-reload
+      systemctl enable opencode-free-bridge >/dev/null 2>&1 || true
+      systemctl restart opencode-free-bridge
+      say "systemd service installed and restarted"
+      return 0
+    elif systemctl --user status >/dev/null 2>&1; then
+      local user_unit_dir="$HOME/.config/systemd/user"
+      local user_unit="$user_unit_dir/opencode-free-bridge.service"
+      mkdir -p "$user_unit_dir"
+      cat > "$user_unit" <<UNIT
+[Unit]
+Description=OpenCode Free Bridge (OpenAI-compatible, free-tier models)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$BINDIR
+Environment=PORT=$PORT
+Environment=HOST=$HOST
+Environment=AUTO_UPDATE=1
+ExecStart=$(command -v node) $BINDIR/server.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+UNIT
+      systemctl --user daemon-reload
+      systemctl --user enable opencode-free-bridge >/dev/null 2>&1 || true
+      systemctl --user restart opencode-free-bridge
+      say "systemd --user service installed and restarted"
+      return 0
+    else
+      warn "no write access to $unit_dir — skipping service install (run with sudo to enable it)"
+      return 1
+    fi
   fi
 
   if [ "$os" = "darwin" ]; then
@@ -108,7 +140,7 @@ UNIT
   <array><string>$(command -v node)</string><string>$BINDIR/server.js</string></array>
   <key>WorkingDirectory</key><string>$BINDIR</string>
   <key>EnvironmentVariables</key>
-  <dict><key>PORT</key><string>$PORT</string><key>HOST</key><string>$HOST</string></dict>
+  <dict><key>PORT</key><string>$PORT</string><key>HOST</key><string>$HOST</string><key>AUTO_UPDATE</key><string>1</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 </dict>
@@ -116,7 +148,7 @@ UNIT
 PLIST
     launchctl unload "$plist" >/dev/null 2>&1 || true
     launchctl load "$plist"
-    say "launchd agent installed and started"
+    say "launchd agent installed and restarted"
     return 0
   fi
 
@@ -134,7 +166,9 @@ fi
 # ------------------------------------------------------------ start check ---
 if [ "$SERVICE_OK" != "1" ]; then
   say "Starting in the background (no service manager)"
-  (cd "$BINDIR" && PORT="$PORT" HOST="$HOST" nohup node server.js >"$BINDIR/bridge.log" 2>&1 &)
+  pkill -f "$BINDIR/server.js" 2>/dev/null || true
+  sleep 0.5
+  (cd "$BINDIR" && PORT="$PORT" HOST="$HOST" AUTO_UPDATE=1 nohup node server.js >"$BINDIR/bridge.log" 2>&1 &)
 fi
 
 say "Waiting for the bridge to come up..."

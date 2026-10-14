@@ -6,6 +6,7 @@ const {
   VERSION,
   MAX_SESSIONS,
   sessionCache,
+  isNewerVersion,
   createId,
   normalizeModel,
   isResponsesModel,
@@ -75,8 +76,12 @@ describe("server unit & integration tests", () => {
     sessionCache.clear();
   });
 
-  it("keeps VERSION synced with package.json", () => {
+  it("keeps VERSION synced with package.json and compares semver accurately", () => {
     assert.equal(VERSION, pkg.version);
+    assert.equal(isNewerVersion("1.5.0", "1.5.1"), true);
+    assert.equal(isNewerVersion("1.5.0", "2.0.0"), true);
+    assert.equal(isNewerVersion("1.5.0", "1.5.0"), false);
+    assert.equal(isNewerVersion("1.5.0", "1.4.9"), false);
   });
 
   it("normalizeModel rejects empty/missing models and strips provider prefixes", () => {

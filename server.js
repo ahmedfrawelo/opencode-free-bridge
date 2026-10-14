@@ -1,6 +1,10 @@
+#!/usr/bin/env node
 const dns = require("dns");
 dns.setDefaultResultOrder("ipv4first");
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const { spawnSync } = require("child_process");
 const crypto = require("crypto");
 let VERSION = "1.5.0";
 try {
@@ -12,7 +16,11 @@ const PORT = parseInt(process.env.PORT || "20129", 10);
 const HOST = process.env.HOST || "127.0.0.1";
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "120000", 10);
 const MAX_BODY_BYTES = parseInt(process.env.MAX_BODY_BYTES || String(10 * 1024 * 1024), 10);
-
+const REPO = process.env.OPENCODE_BRIDGE_REPO || "azrinaldi/opencode-free-bridge";
+const BRANCH = process.env.OPENCODE_BRIDGE_BRANCH || "main";
+const RAW_BASE_URL =
+  process.env.OPENCODE_BRIDGE_RAW_URL || `https://raw.githubusercontent.com/${REPO}/${BRANCH}`;
+const AUTO_UPDATE = process.env.AUTO_UPDATE !== "0" && process.env.AUTO_UPDATE !== "false";
 // OpenCode v2 moved free-tier inference from /zen/v1/* to /inference/v1/*.
 // Requests to /zen/v1/* now fail with 403 FreeTierError.
 const OPENCODE_RESPONSES_URL =
@@ -82,6 +90,74 @@ const FALLBACK_MODELS = [
 let activeModels = [...FALLBACK_MODELS];
 let lastDiscoveryTime = 0;
 const DISCOVERY_TTL_MS = 60 * 60 * 1000; // Auto-refresh every 1 hour
+let lastUpdateCheckTime = 0;
+let updateInProgress = false;
+
+function isNewerVersion(currentVer, remoteVer) {
+  const pa = String(currentVer || "").replace(/^v/i, "").split(".").map((n) => parseInt(n, 10) || 0);
+  const pb = String(remoteVer || "").replace(/^v/i, "").split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    if ((pb[i] || 0) > (pa[i] || 0)) return true;
+    if ((pb[i] || 0) < (pa[i] || 0)) return false;
+  }
+  return false;
+}
+
+// Lightweight self-updater: when a newer version is pushed to GitHub main,
+// downloads & syntax-checks the runtime files, replaces them atomically, and
+// exits cleanly so systemd/launchd restarts the bridge on the new release.
+async function checkAndApplyUpdate() {
+  if (!AUTO_UPDATE || updateInProgress) return false;
+  updateInProgress = true;
+  lastUpdateCheckTime = Date.now();
+  const tmpFiles = [];
+  try {
+    const pkgRes = await fetch(`${RAW_BASE_URL}/package.json`, {
+      headers: { "Cache-Control": "no-cache" },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!pkgRes.ok) return false;
+    const remotePkg = await pkgRes.json();
+    const remoteVersion = String(remotePkg?.version || "").trim();
+    if (!remoteVersion || !isNewerVersion(VERSION, remoteVersion)) return false;
+
+    console.log(`[opencode-bridge] New release v${remoteVersion} found on GitHub (current: v${VERSION}). Updating...`);
+    const files = ["package.json", "token-budget.js", "verify.js", "server.js"];
+    for (const file of files) {
+      const res = await fetch(`${RAW_BASE_URL}/${file}`, {
+        headers: { "Cache-Control": "no-cache" },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${file}`);
+      const text = await res.text();
+      if (!text || text.length < 20) throw new Error(`Empty response for ${file}`);
+      const tmpPath = path.join(__dirname, `.${file}.tmp.${process.pid}`);
+      fs.writeFileSync(tmpPath, text, "utf8");
+      tmpFiles.push({ tmpPath, targetPath: path.join(__dirname, file) });
+      if (file.endsWith(".js")) {
+        const chk = spawnSync(process.execPath, ["--check", tmpPath], { encoding: "utf8" });
+        if (chk.status !== 0) throw new Error(`Syntax check failed for ${file}`);
+      }
+    }
+    for (const { tmpPath, targetPath } of tmpFiles) {
+      fs.renameSync(tmpPath, targetPath);
+    }
+    console.log(`[opencode-bridge] Updated to v${remoteVersion}. Exiting for service restart.`);
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 2000).unref();
+    return true;
+  } catch (err) {
+    for (const { tmpPath } of tmpFiles) {
+      try {
+        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+      } catch {}
+    }
+    console.warn(`[opencode-bridge] Auto-update skipped: ${err.message}`);
+    return false;
+  } finally {
+    updateInProgress = false;
+  }
+}
 
 async function refreshCliVersion() {
   if (process.env.OPENCODE_USER_AGENT) return;
@@ -103,6 +179,7 @@ async function refreshCliVersion() {
 // Auto-discovery from OpenCode upstream gateway
 async function discoverModels() {
   await refreshCliVersion();
+  checkAndApplyUpdate().catch(() => {});
   try {
     const res = await fetch(OPENCODE_MODELS_URL, {
       headers: {
@@ -837,6 +914,11 @@ function handleRequest(req, res) {
           } catch {
             errJson = { message: errText };
           }
+          // If upstream rejects with 403 (e.g. OpenCode changed its gate again),
+          // immediately check GitHub for a hotfix release (max once per 5 min).
+          if (upstreamRes.status === 403 && Date.now() - lastUpdateCheckTime > 5 * 60 * 1000) {
+            checkAndApplyUpdate().catch(() => {});
+          }
           res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
           return res.end(
             JSON.stringify({
@@ -1298,6 +1380,8 @@ module.exports = {
   MAX_SESSIONS,
   SESSION_TTL_MS,
   sessionCache,
+  isNewerVersion,
+  checkAndApplyUpdate,
   createId,
   isValidV2UserAgent,
   normalizeModel,
