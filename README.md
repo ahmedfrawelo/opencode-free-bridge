@@ -78,16 +78,61 @@ Summary
 | API key | `public` (any value is accepted) |
 | Model | any id returned by `/v1/models` |
 
-### 9Router
+### Via a gateway (recommended) — bridge = one connection
 
-Add a custom OpenAI-compatible provider:
+The bridge is a plain OpenAI-compatible upstream. In any gateway you add it
+as a custom provider/connection, import `/v1/models`, and let the gateway own
+fallback / load-balance / billing. The bridge itself holds no fallback list:
+when upstream is unreachable `/v1/models` is honestly empty — retry the
+import after discovery completes.
 
-- **Base URL:** `http://127.0.0.1:20129/v1`
-- **API key:** `public`
-- **Prefix:** `zen`
-- **Model IDs:** leave empty, then use **Import from /models endpoint**
+#### 9Router
 
-Models are then available as `zen/big-pickle`, `zen/muse-spark-1.3-contributor-free`, and so on.
+1. Add a custom OpenAI-compatible provider:
+   - **Base URL:** `http://127.0.0.1:20129/v1`
+   - **API key:** `public` (any value is accepted)
+   - **Prefix:** `zen`
+   - **Model IDs:** leave empty, then **Import from /models endpoint**
+2. Models appear as `zen/big-pickle`, `zen/muse-spark-1.3-contributor-free`, etc.
+3. Optional but recommended: register each bridge host (laptop, VPS) as a
+   separate connection, then set gateway fallback `zen/*` → your paid
+   provider so a `BUSY` (upstream 429 on one IP) fails over automatically.
+
+If the import returns zero models, the bridge hasn't reached upstream yet —
+wait a minute and import again (`curl -s http://127.0.0.1:20129/v1/models`
+shows the live list).
+
+#### Other gateways (LiteLLM, Open WebUI, AnythingLLM, …)
+
+Same three fields everywhere — base URL + `public` key + import models:
+
+```yaml
+# LiteLLM config.yaml example
+model_list:
+  - model_name: zen-big-pickle
+    litellm_params:
+      model: openai/big-pickle
+      api_base: http://127.0.0.1:20129/v1
+      api_key: public
+```
+
+In Open WebUI: Settings → Connections → `+` → Base URL
+`http://127.0.0.1:20129/v1`, key `public`, fetch models.
+
+### Direct in an agent / harness (no gateway)
+
+Any harness that speaks OpenAI-compatible (Hermes, coding agents, your own
+scripts) can point straight at the bridge — no gateway needed:
+
+```bash
+export OPENAI_BASE_URL="http://127.0.0.1:20129/v1"
+export OPENAI_API_KEY="public"   # any value works
+export MODEL="big-pickle"        # any id from /v1/models
+```
+
+Own your fallback in the harness: on `BUSY` / 429 (upstream throttling this
+IP) retry another model id, and on an empty `/v1/models` wait for discovery
+instead of failing over to a stale list.
 
 ### OpenAI SDK
 
