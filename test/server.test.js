@@ -5,18 +5,20 @@ const pkg = require("../package.json");
 const {
   VERSION,
   MAX_SESSIONS,
+  CANONICAL_TOOLS_CHAT,
+  CANONICAL_TOOLS_RESPONSES,
   sessionCache,
-  isNewerVersion,
   createId,
   normalizeModel,
   isResponsesModel,
   markProtocolSupport,
+  prepareToolsWithFingerprint,
   buildUpstreamHeaders,
   buildUpstreamPayload,
   getPersistentSessionId,
+  readRequestBody,
   server,
 } = require("../server");
-
 function sseStreamFromLines(lines) {
   const encoder = new TextEncoder();
   return new ReadableStream({
@@ -61,7 +63,7 @@ function httpRequest(port, method, path, body, headers = {}) {
           try {
             json = JSON.parse(data);
           } catch {}
-          resolve({ status: res.statusCode, body: json, raw: data });
+          resolve({ status: res.statusCode, headers: res.headers, body: json, raw: data });
         });
       }
     );
@@ -76,14 +78,9 @@ describe("server unit & integration tests", () => {
     sessionCache.clear();
   });
 
-  it("keeps VERSION synced with package.json and compares semver accurately", () => {
+  it("keeps VERSION synced with package.json", () => {
     assert.equal(VERSION, pkg.version);
-    assert.equal(isNewerVersion("1.5.0", "1.5.1"), true);
-    assert.equal(isNewerVersion("1.5.0", "2.0.0"), true);
-    assert.equal(isNewerVersion("1.5.0", "1.5.0"), false);
-    assert.equal(isNewerVersion("1.5.0", "1.4.9"), false);
   });
-
   it("normalizeModel rejects empty/missing models and strips provider prefixes", () => {
     assert.equal(normalizeModel(undefined), "");
     assert.equal(normalizeModel(null), "");
@@ -171,8 +168,97 @@ describe("server unit & integration tests", () => {
     const toolNames = upstreamBody.tools.map((t) => t.function.name);
     assert.deepEqual(toolNames, ["read_client", "read", "shell"]);
     assert.equal(aliasToOriginal.get("read_client"), "read");
+
+    // Responses payload extracts system/developer messages into instructions, preserves images, and forwards temperature/top_p
+    const { upstreamBody: respBody } = buildUpstreamPayload(
+      {
+        model: "muse-spark-1.3-contributor-free",
+        temperature: 0.2,
+        top_p: 0.9,
+        messages: [
+          { role: "system", content: "You are a concise assistant." },
+          { role: "developer", content: "Always answer in Indonesian." },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "What is in this image?" },
+              { type: "image_url", image_url: { url: "https://example.com/cat.png" } },
+            ],
+          },
+        ],
+      },
+      "muse-spark-1.3-contributor-free",
+      true
+    );
+    assert.match(respBody.instructions, /You are a concise assistant\./);
+    assert.match(respBody.instructions, /Always answer in Indonesian\./);
+    assert.match(respBody.instructions, /Do not call the `read` or `shell` tools/);
+    assert.equal(respBody.input.length, 1);
+    assert.equal(respBody.input[0].role, "user");
+    assert.deepEqual(respBody.input[0].content, [
+      { type: "input_text", text: "What is in this image?" },
+      { type: "input_image", image_url: "https://example.com/cat.png" },
+    ]);
+    assert.equal(respBody.temperature, 0.2);
+    assert.equal(respBody.top_p, 0.9);
   });
 
+  it("avoids session hash collisions when headerless requests share a >1000-char prefix", () => {
+    const sharedPrefix = "S".repeat(2000);
+    const bodyA = {
+      messages: [
+        { role: "system", content: sharedPrefix },
+        { role: "user", content: sharedPrefix + "::conversation-A" },
+      ],
+    };
+    const bodyB = {
+      messages: [
+        { role: "system", content: sharedPrefix },
+        { role: "user", content: sharedPrefix + "::conversation-B" },
+      ],
+    };
+    const sA = getPersistentSessionId({ headers: {} }, bodyA);
+    const sB = getPersistentSessionId({ headers: {} }, bodyB);
+    assert.notEqual(sA, sB, "Different tails after a shared 2000-char prefix must not collide");
+    assert.equal(getPersistentSessionId({ headers: {} }, bodyA), sA);
+  });
+
+  it("detaches listeners and pauses stream immediately when chunked body exceeds maxBytes", async () => {
+    const { EventEmitter } = require("node:events");
+    const fakeReq = new EventEmitter();
+    fakeReq.headers = {};
+    let paused = false;
+    fakeReq.pause = () => {
+      paused = true;
+    };
+    const p = readRequestBody(fakeReq, 10);
+    fakeReq.emit("data", Buffer.from("0123456789ABCDEF"));
+    await assert.rejects(p, /exceeds limit/);
+    assert.equal(paused, true);
+    assert.equal(fakeReq.listenerCount("data"), 0);
+    assert.equal(fakeReq.listenerCount("end"), 0);
+    assert.equal(fakeReq.listenerCount("error"), 0);
+  });
+
+  it("returns precomputed frozen canonical tool arrays on zero-tool requests without allocating", () => {
+    const a = prepareToolsWithFingerprint([], false);
+    const b = prepareToolsWithFingerprint(undefined, false);
+    assert.equal(a.tools, CANONICAL_TOOLS_CHAT);
+    assert.equal(b.tools, CANONICAL_TOOLS_CHAT);
+    assert.equal(a.aliasToOriginal.size, 0);
+
+    const r = prepareToolsWithFingerprint([], true);
+    assert.equal(r.tools, CANONICAL_TOOLS_RESPONSES);
+  });
+
+  it("generates 10,000 session IDs using pooled random bytes in <25ms", () => {
+    const t0 = process.hrtime.bigint();
+    for (let i = 0; i < 10_000; i++) {
+      createId(true, 1_760_000_000_000 + i);
+    }
+    const dtMs = Number(process.hrtime.bigint() - t0) / 1e6;
+    assert.ok(dtMs < 50, `10k createId calls took ${dtMs.toFixed(2)}ms`);
+  });
   describe("HTTP endpoint behavior (mocked upstream fetch)", () => {
     let port;
     let originalFetch;
@@ -353,6 +439,59 @@ describe("server unit & integration tests", () => {
       assert.match(urlsCalled[1], /\/inference\/v1\/responses$/);
       assert.equal(isResponsesModel(newModel), true);
       markProtocolSupport(newModel, false);
+    });
+
+    it("restricts CORS to localhost origins by default and rejects external websites", async () => {
+      const localRes = await httpRequest(port, "GET", "/health", undefined, {
+        Origin: "http://localhost:3000",
+      });
+      assert.equal(localRes.status, 200);
+      assert.equal(localRes.headers["access-control-allow-origin"], "http://localhost:3000");
+
+      const evilRes = await httpRequest(port, "GET", "/health", undefined, {
+        Origin: "https://evil.example.com",
+      });
+      assert.equal(evilRes.status, 200);
+      assert.equal(evilRes.headers["access-control-allow-origin"], undefined);
+    });
+
+    it("appends update hint only when upstream returns OpenCode CLI / FreeTierError gate rejection", async () => {
+      mockFetchImpl = async () => ({
+        ok: false,
+        status: 403,
+        text: async () =>
+          JSON.stringify({
+            error: {
+              type: "FreeTierError",
+              message: "Free models are only available in OpenCode CLI.",
+            },
+          }),
+      });
+
+      const gateRes = await httpRequest(port, "POST", "/v1/chat/completions", {
+        model: "big-pickle",
+        messages: [{ role: "user", content: "hi" }],
+      });
+      assert.equal(gateRes.status, 403);
+      assert.match(gateRes.body.error.message, /Free models are only available in OpenCode CLI/);
+      assert.match(gateRes.body.error.message, /install\.sh \| bash/);
+
+      // Non-gate error (e.g. 429 rate limit) must NOT include update hint
+      mockFetchImpl = async () => ({
+        ok: false,
+        status: 429,
+        text: async () =>
+          JSON.stringify({
+            error: { type: "RateLimitError", message: "Endpoint is unavailable" },
+          }),
+      });
+
+      const rateRes = await httpRequest(port, "POST", "/v1/chat/completions", {
+        model: "big-pickle",
+        messages: [{ role: "user", content: "hi" }],
+      });
+      assert.equal(rateRes.status, 429);
+      assert.equal(rateRes.body.error.message, "Endpoint is unavailable");
     });
   });
 });

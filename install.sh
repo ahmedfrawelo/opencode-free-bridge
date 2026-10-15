@@ -57,7 +57,7 @@ fetch server.js
 fetch token-budget.js
 fetch verify.js
 chmod +x "$BINDIR/server.js" "$BINDIR/verify.js" 2>/dev/null || true
-say "Files installed (v$(node -p "require('$BINDIR/package.json').version" 2>/dev/null || echo 'latest'))"
+say "Files installed (v$(node -p 'require(process.argv[1]).version' "$BINDIR/package.json" 2>/dev/null || echo 'latest'))"
 
 # ---------------------------------------------------------------- service ---
 install_service() {
@@ -77,11 +77,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$(id -un)
-WorkingDirectory=$BINDIR
+WorkingDirectory="$BINDIR"
 Environment=PORT=$PORT
 Environment=HOST=$HOST
-Environment=AUTO_UPDATE=1
-ExecStart=$(command -v node) $BINDIR/server.js
+ExecStart="$(command -v node)" "$BINDIR/server.js"
 Restart=always
 RestartSec=3
 MemoryMax=512M
@@ -105,14 +104,13 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=$BINDIR
+WorkingDirectory="$BINDIR"
 Environment=PORT=$PORT
 Environment=HOST=$HOST
-Environment=AUTO_UPDATE=1
-ExecStart=$(command -v node) $BINDIR/server.js
+ExecStart="$(command -v node)" "$BINDIR/server.js"
 Restart=always
 RestartSec=3
-
+MemoryMax=512M
 [Install]
 WantedBy=default.target
 UNIT
@@ -140,7 +138,7 @@ UNIT
   <array><string>$(command -v node)</string><string>$BINDIR/server.js</string></array>
   <key>WorkingDirectory</key><string>$BINDIR</string>
   <key>EnvironmentVariables</key>
-  <dict><key>PORT</key><string>$PORT</string><key>HOST</key><string>$HOST</string><key>AUTO_UPDATE</key><string>1</string></dict>
+  <dict><key>PORT</key><string>$PORT</string><key>HOST</key><string>$HOST</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 </dict>
@@ -166,9 +164,9 @@ fi
 # ------------------------------------------------------------ start check ---
 if [ "$SERVICE_OK" != "1" ]; then
   say "Starting in the background (no service manager)"
-  pkill -f "$BINDIR/server.js" 2>/dev/null || true
+  pkill -f -- "$BINDIR/server.js" 2>/dev/null || true
   sleep 0.5
-  (cd "$BINDIR" && PORT="$PORT" HOST="$HOST" AUTO_UPDATE=1 nohup node server.js >"$BINDIR/bridge.log" 2>&1 &)
+  (cd "$BINDIR" && PORT="$PORT" HOST="$HOST" nohup node server.js >"$BINDIR/bridge.log" 2>&1 &)
 fi
 
 say "Waiting for the bridge to come up..."

@@ -44,6 +44,7 @@ const REASONING_MODEL_HINTS = [
   "cat-jam",
   "pickle",
   "step-",
+  "deepseek",
 ];
 
 function isReasoningModel(modelId) {

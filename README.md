@@ -24,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/azrinaldi/opencode-free-bridge/main
 
 The installer places the bridge in `~/.opencode-free-bridge`, registers a boot service (systemd on Linux, launchd on macOS), starts it, and runs a self-check.
 
-**Updates are automatic**: when a new release is pushed to GitHub (for example, when upstream changes its fingerprint), the running bridge automatically downloads, syntax-checks, and restarts onto the new version. You can also update manually at any time by re-running the install command above.
+To update to the latest release at any time, re-run the install command above (or `git pull && systemctl restart opencode-free-bridge`).
 Options:
 
 ```bash
@@ -218,7 +218,7 @@ Then register `http://127.0.0.1:20130/v1` as an additional connection.
 |---|---|---|
 | `PORT` | `20129` | Listen port |
 | `HOST` | `127.0.0.1` | Bind address. Set to `0.0.0.0` to expose on the network — only behind a firewall, the endpoint has no authentication. |
-| `AUTO_UPDATE` | `1` | Automatically pull & apply new releases from GitHub (`0` to disable) |
+| `CORS_ORIGIN` | `""` (localhost only) | Allowed CORS origin(s) (comma-separated, or `*` to allow all origins) |
 | `UPSTREAM_TIMEOUT_MS` | `120000` | Upstream request timeout in milliseconds |
 | `MAX_BODY_BYTES` | `10485760` | Maximum request payload size in bytes (10 MiB) |
 ## Troubleshooting

@@ -21,6 +21,7 @@ describe("token-budget", () => {
       "cat-jam-free",
       "big-pickle",
       "step-5-preview-free",
+      "deepseek-v4.1-flash-free",
     ];
     for (const model of reasoningModels) {
       assert.equal(isReasoningModel(model), true, `Expected ${model} to be a reasoning model`);

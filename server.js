@@ -2,9 +2,6 @@
 const dns = require("dns");
 dns.setDefaultResultOrder("ipv4first");
 const http = require("http");
-const fs = require("fs");
-const path = require("path");
-const { spawnSync } = require("child_process");
 const crypto = require("crypto");
 let VERSION = "1.5.0";
 try {
@@ -16,11 +13,7 @@ const PORT = parseInt(process.env.PORT || "20129", 10);
 const HOST = process.env.HOST || "127.0.0.1";
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "120000", 10);
 const MAX_BODY_BYTES = parseInt(process.env.MAX_BODY_BYTES || String(10 * 1024 * 1024), 10);
-const REPO = process.env.OPENCODE_BRIDGE_REPO || "azrinaldi/opencode-free-bridge";
-const BRANCH = process.env.OPENCODE_BRIDGE_BRANCH || "main";
-const RAW_BASE_URL =
-  process.env.OPENCODE_BRIDGE_RAW_URL || `https://raw.githubusercontent.com/${REPO}/${BRANCH}`;
-const AUTO_UPDATE = process.env.AUTO_UPDATE !== "0" && process.env.AUTO_UPDATE !== "false";
+const CORS_ORIGIN = process.env.CORS_ORIGIN !== undefined ? process.env.CORS_ORIGIN : "";
 // OpenCode v2 moved free-tier inference from /zen/v1/* to /inference/v1/*.
 // Requests to /zen/v1/* now fail with 403 FreeTierError.
 const OPENCODE_RESPONSES_URL =
@@ -31,7 +24,21 @@ const OPENCODE_MODELS_URL =
   process.env.OPENCODE_MODELS_URL || "https://opencode.ai/inference/v1/models";
 const OPENCODE_RELEASES_ATOM_URL =
   process.env.OPENCODE_RELEASES_ATOM_URL || "https://github.com/anomalyco/opencode/releases.atom";
+const UPDATE_HINT =
+  "Update opencode-free-bridge: curl -fsSL https://raw.githubusercontent.com/azrinaldi/opencode-free-bridge/main/install.sh | bash";
 
+function isFreeTierCliGateError(status, errType, errMsg) {
+  if (errType === "FreeTierError") return true;
+  if (status !== 403 && status !== 401) return false;
+  const m = String(errMsg || "").toLowerCase();
+  return (
+    m.includes("freetiererror") ||
+    m.includes("free tier") ||
+    m.includes("free models") ||
+    m.includes("opencode cli") ||
+    m.includes("only available in opencode")
+  );
+}
 const DEFAULT_CLI_VERSION = "2.0.29";
 let currentUserAgent =
   process.env.OPENCODE_USER_AGENT || `opencode/latest/${DEFAULT_CLI_VERSION}/cli`;
@@ -53,6 +60,22 @@ const SESSION_PREFIX_MASK = (1n << 48n) - 1n;
 const MAX_COUNTER_PER_MS = 16;
 let lastTimestamp = 0;
 let counter = 0;
+const RAND_POOL_SIZE = 14 * 256;
+const randPool = Buffer.allocUnsafe(RAND_POOL_SIZE);
+let randPoolOffset = RAND_POOL_SIZE;
+
+function nextRandomBase62_14() {
+  if (randPoolOffset + 14 > RAND_POOL_SIZE) {
+    crypto.randomFillSync(randPool);
+    randPoolOffset = 0;
+  }
+  let out = "";
+  for (let i = 0; i < 14; i++) {
+    out += CHARS[randPool[randPoolOffset + i] % 62];
+  }
+  randPoolOffset += 14;
+  return out;
+}
 
 function createId(descending, timestamp = Date.now()) {
   if (timestamp !== lastTimestamp) {
@@ -64,13 +87,7 @@ function createId(descending, timestamp = Date.now()) {
   const effectiveCounter = ((counter - 1) % MAX_COUNTER_PER_MS) + 1;
   const current = BigInt(timestamp + extraMs) * 0x1000n + BigInt(effectiveCounter);
   const value = (descending ? ~current : current) & SESSION_PREFIX_MASK;
-  const time = value.toString(16).padStart(12, "0");
-  const randomBytes = crypto.randomBytes(14);
-  let randomStr = "";
-  for (let i = 0; i < randomBytes.length; i++) {
-    randomStr += CHARS[randomBytes[i] % 62];
-  }
-  return time + randomStr;
+  return value.toString(16).padStart(12, "0") + nextRandomBase62_14();
 }
 
 // Live model list, discovered from upstream at boot and refreshed hourly.
@@ -78,10 +95,10 @@ function createId(descending, timestamp = Date.now()) {
 // yet", so gateways/harnesses apply their own fallback instead of being
 // served a stale lie.
 let activeModels = [];
+let cachedModelsPayload = '{"object":"list","data":[]}';
+let cachedHealthPayload = "";
 let lastDiscoveryTime = 0;
 const DISCOVERY_TTL_MS = 60 * 60 * 1000; // Auto-refresh every 1 hour
-let lastUpdateCheckTime = 0;
-let updateInProgress = false;
 // Single-flight: concurrent /v1/models hits after TTL expiry share one upstream
 // fetch instead of stampeding (50 parallel GETs = 1 upstream call, not 50).
 let discoveryInFlight = null;
@@ -90,89 +107,39 @@ let discoveryInFlight = null;
 let lastCliVersionCheckTime = 0;
 const CLI_VERSION_TTL_MS = 6 * 60 * 60 * 1000;
 
-function isNewerVersion(currentVer, remoteVer) {
-  const pa = String(currentVer || "").replace(/^v/i, "").split(".").map((n) => parseInt(n, 10) || 0);
-  const pb = String(remoteVer || "").replace(/^v/i, "").split(".").map((n) => parseInt(n, 10) || 0);
-  for (let i = 0; i < 3; i++) {
-    if ((pb[i] || 0) > (pa[i] || 0)) return true;
-    if ((pb[i] || 0) < (pa[i] || 0)) return false;
-  }
-  return false;
+function rebuildDiscoveryPayloads() {
+  cachedModelsPayload = JSON.stringify({ object: "list", data: activeModels });
+  cachedHealthPayload = JSON.stringify({
+    status: "ok",
+    provider: "opencode-free-bridge",
+    version: VERSION,
+    discoveredModels: activeModels.length,
+  });
 }
+rebuildDiscoveryPayloads();
 
-// Lightweight self-updater: when a newer version is pushed to GitHub main,
-// downloads & syntax-checks the runtime files, replaces them atomically, and
-// exits cleanly so systemd/launchd restarts the bridge on the new release.
-async function checkAndApplyUpdate() {
-  if (!AUTO_UPDATE || updateInProgress) return false;
-  updateInProgress = true;
-  lastUpdateCheckTime = Date.now();
-  const tmpFiles = [];
-  try {
-    const pkgRes = await fetch(`${RAW_BASE_URL}/package.json`, {
-      headers: { "Cache-Control": "no-cache" },
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!pkgRes.ok) return false;
-    const remotePkg = await pkgRes.json();
-    const remoteVersion = String(remotePkg?.version || "").trim();
-    if (!remoteVersion || !isNewerVersion(VERSION, remoteVersion)) return false;
-
-    console.log(`[opencode-bridge] New release v${remoteVersion} found on GitHub (current: v${VERSION}). Updating...`);
-    const files = ["package.json", "token-budget.js", "verify.js", "server.js"];
-    for (const file of files) {
-      const res = await fetch(`${RAW_BASE_URL}/${file}`, {
-        headers: { "Cache-Control": "no-cache" },
-        signal: AbortSignal.timeout(15000),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${file}`);
-      const text = await res.text();
-      if (!text || text.length < 20) throw new Error(`Empty response for ${file}`);
-      const tmpPath = path.join(__dirname, `.${file}.tmp.${process.pid}`);
-      fs.writeFileSync(tmpPath, text, "utf8");
-      tmpFiles.push({ tmpPath, targetPath: path.join(__dirname, file) });
-      if (file.endsWith(".js")) {
-        const chk = spawnSync(process.execPath, ["--check", tmpPath], { encoding: "utf8" });
-        if (chk.status !== 0) throw new Error(`Syntax check failed for ${file}`);
-      }
-    }
-    for (const { tmpPath, targetPath } of tmpFiles) {
-      fs.renameSync(tmpPath, targetPath);
-    }
-    console.log(`[opencode-bridge] Updated to v${remoteVersion}. Exiting for service restart.`);
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 2000).unref();
-    return true;
-  } catch (err) {
-    for (const { tmpPath } of tmpFiles) {
-      try {
-        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-      } catch {}
-    }
-    console.warn(`[opencode-bridge] Auto-update skipped: ${err.message}`);
-    return false;
-  } finally {
-    updateInProgress = false;
-  }
+function isLocalOrigin(origin) {
+  if (typeof origin !== "string" || !origin) return false;
+  return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(origin.trim());
 }
 
 async function refreshCliVersion() {
   if (process.env.OPENCODE_USER_AGENT) return;
   const now = Date.now();
   if (now - lastCliVersionCheckTime < CLI_VERSION_TTL_MS) return;
-  lastCliVersionCheckTime = now;
   try {
     const res = await fetch(OPENCODE_RELEASES_ATOM_URL, {
       signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) return;
+    lastCliVersionCheckTime = now;
     const text = await res.text();
     const match = text.match(/<title>v?(\d+\.\d+\.\d+)<\/title>/i);
     if (match && parseInt(match[1].split(".")[0], 10) >= 2) {
       currentUserAgent = `opencode/latest/${match[1]}/cli`;
     }
   } catch {
-    // Keep existing currentUserAgent on network error
+    // Keep existing currentUserAgent on network error; retry on next discovery
   }
 }
 
@@ -184,7 +151,6 @@ async function discoverModels() {
   if (discoveryInFlight) return discoveryInFlight;
   discoveryInFlight = (async () => {
     refreshCliVersion().catch(() => {});
-    checkAndApplyUpdate().catch(() => {});
     try {
     const res = await fetch(OPENCODE_MODELS_URL, {
       headers: {
@@ -211,12 +177,13 @@ async function discoverModels() {
 
     if (freeItems.length > 0) {
       activeModels = freeItems;
+      rebuildDiscoveryPayloads();
       lastDiscoveryTime = Date.now();
-      console.log(`[opencode-bridge] Auto-discovered ${activeModels.length} free models from upstream gateway.`);
+      console.log(`[opencode-free-bridge] Auto-discovered ${activeModels.length} free models from upstream gateway.`);
       return;
     }
     } catch (err) {
-      console.warn(`[opencode-bridge] Auto-discovery warning: ${err.message}. Model list stays empty until upstream answers.`);
+      console.warn(`[opencode-free-bridge] Auto-discovery warning: ${err.message}. Model list stays empty until upstream answers.`);
     }
   })();
   try {
@@ -255,9 +222,9 @@ const MODEL_MAP = {
 
 function normalizeModel(rawModel) {
   if (typeof rawModel !== "string") return "";
-  const stripped = rawModel.trim().replace(/^(opencode\/|oc\/|zen\/|9router\/)/i, "").trim();
+  const stripped = rawModel.trim().replace(/^(opencode\/|oc\/|zen\/|9router\/|openai\/)/i, "").trim();
   if (!stripped) return "";
-  return MODEL_MAP[stripped] || stripped;
+  return MODEL_MAP[stripped.toLowerCase()] || stripped;
 }
 
 // Protocol routing: tracks which models require /inference/v1/responses vs
@@ -358,13 +325,52 @@ function getToolName(tool) {
   return "";
 }
 
+function stableStringify(val) {
+  if (!val || typeof val !== "object") return JSON.stringify(val);
+  if (Array.isArray(val)) return "[" + val.map(stableStringify).join(",") + "]";
+  const keys = Object.keys(val).sort();
+  return "{" + keys.map((k) => JSON.stringify(k) + ":" + stableStringify(val[k])).join(",") + "}";
+}
+
+const FINGERPRINT_PARAM_STRINGS = {
+  read: stableStringify(FINGERPRINT_TOOL_DEFINITIONS.read.parameters),
+  shell: stableStringify(FINGERPRINT_TOOL_DEFINITIONS.shell.parameters),
+};
+
+const CANONICAL_TOOLS_CHAT = Object.freeze(
+  FINGERPRINT_TOOL_NAMES.map((name) =>
+    Object.freeze({
+      type: "function",
+      function: Object.freeze({
+        name,
+        description: FINGERPRINT_TOOL_DEFINITIONS[name].description,
+        parameters: FINGERPRINT_TOOL_DEFINITIONS[name].parameters,
+      }),
+    })
+  )
+);
+
+const CANONICAL_TOOLS_RESPONSES = Object.freeze(
+  FINGERPRINT_TOOL_NAMES.map((name) =>
+    Object.freeze({
+      type: "function",
+      name,
+      description: FINGERPRINT_TOOL_DEFINITIONS[name].description,
+      parameters: FINGERPRINT_TOOL_DEFINITIONS[name].parameters,
+      strict: false,
+    })
+  )
+);
+
+const EMPTY_MAP = Object.freeze(new Map());
+
 function isExactFingerprintDef(tool, key) {
   const want = FINGERPRINT_TOOL_DEFINITIONS[key];
   if (!want || !tool || typeof tool !== "object") return false;
   const def = tool.function && typeof tool.function === "object" ? tool.function : tool;
   return (
     def.description === want.description &&
-    JSON.stringify(def.parameters) === JSON.stringify(want.parameters)
+    stableStringify(def.parameters) === FINGERPRINT_PARAM_STRINGS[key]
   );
 }
 
@@ -376,15 +382,25 @@ function buildPlaceholderNote(appendedNames) {
     : `Do not call the ${list} tool; it is a placeholder that does nothing. Use the other tools you have been given instead.`;
 }
 
+const DEFAULT_PLACEHOLDER_NOTE = buildPlaceholderNote(FINGERPRINT_TOOL_NAMES);
+
 function prepareToolsWithFingerprint(clientTools = [], flat = false) {
+  if (!Array.isArray(clientTools) || clientTools.length === 0) {
+    return {
+      tools: flat ? CANONICAL_TOOLS_RESPONSES : CANONICAL_TOOLS_CHAT,
+      appended: FINGERPRINT_TOOL_NAMES,
+      placeholderNote: DEFAULT_PLACEHOLDER_NOTE,
+      aliasToOriginal: EMPTY_MAP,
+      originalToAlias: EMPTY_MAP,
+    };
+  }
   const aliasToOriginal = new Map();
   const originalToAlias = new Map();
   const normalized = [];
-  const rawList = Array.isArray(clientTools) ? clientTools : [];
-  const takenNames = new Set(rawList.map(getToolName).filter(Boolean));
+  const takenNames = new Set(clientTools.map(getToolName).filter(Boolean));
   const presentExactFingerprints = new Set();
 
-  for (const t of rawList) {
+  for (const t of clientTools) {
     const name = getToolName(t);
     if (!name) continue;
     const def = t.function && typeof t.function === "object" ? t.function : t;
@@ -428,18 +444,23 @@ function prepareToolsWithFingerprint(clientTools = [], flat = false) {
   }
 
   const appended = [];
-  for (const name of FINGERPRINT_TOOL_NAMES) {
+  for (let i = 0; i < FINGERPRINT_TOOL_NAMES.length; i++) {
+    const name = FINGERPRINT_TOOL_NAMES[i];
     if (presentExactFingerprints.has(name)) continue;
-    const { description, parameters } = FINGERPRINT_TOOL_DEFINITIONS[name];
-    normalized.push(
-      flat
-        ? { type: "function", name, description, parameters, strict: false }
-        : { type: "function", function: { name, description, parameters } }
-    );
+    normalized.push(flat ? CANONICAL_TOOLS_RESPONSES[i] : CANONICAL_TOOLS_CHAT[i]);
     appended.push(name);
   }
 
-  return { tools: normalized, appended, aliasToOriginal, originalToAlias };
+  return {
+    tools: normalized,
+    appended,
+    placeholderNote:
+      appended.length === FINGERPRINT_TOOL_NAMES.length
+        ? DEFAULT_PLACEHOLDER_NOTE
+        : buildPlaceholderNote(appended),
+    aliasToOriginal,
+    originalToAlias,
+  };
 }
 
 function prepareResponsesTools(clientTools = []) {
@@ -495,11 +516,63 @@ function shortText(content, limit = 1000) {
   }
 }
 
+function messageSignatureSample(content, limit = 1000) {
+  if (typeof content === "string") {
+    const len = content.length;
+    if (len <= limit) return `${len}:${content}`;
+    const half = Math.floor(limit / 2);
+    return `${len}:${content.slice(0, half)}..${content.slice(len - half)}`;
+  }
+  if (Array.isArray(content)) {
+    const head = shortText(content, Math.floor(limit / 2));
+    const last = content[content.length - 1];
+    const tail = shortText(last ? [last] : [], Math.floor(limit / 2));
+    return `${content.length}:${head}..${tail}`;
+  }
+  return shortText(content, limit);
+}
+
+function transformResponsesContent(content, role = "user") {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const hasNonText = content.some(
+      (p) =>
+        p &&
+        typeof p === "object" &&
+        (p.type === "image_url" || p.type === "input_image" || p.type === "input_file")
+    );
+    if (!hasNonText) return extractContent(content);
+    const textType = role === "assistant" ? "output_text" : "input_text";
+    const parts = [];
+    for (const p of content) {
+      if (typeof p === "string") {
+        parts.push({ type: textType, text: p });
+      } else if (p && typeof p === "object") {
+        if (p.type === "text" || p.type === "input_text" || p.type === "output_text") {
+          parts.push({ type: textType, text: String(p.text ?? "") });
+        } else if (p.type === "image_url") {
+          const imageUrl = typeof p.image_url === "string" ? p.image_url : p.image_url?.url;
+          if (imageUrl) parts.push({ type: "input_image", image_url: imageUrl });
+        } else if (p.type === "input_image" || p.type === "input_file") {
+          parts.push(p);
+        } else if (p.text) {
+          parts.push({ type: textType, text: String(p.text) });
+        }
+      }
+    }
+    return parts;
+  }
+  return extractContent(content);
+}
+
 // Convert OpenAI messages to OpenCode input format (for Responses API)
 function transformToResponsesInput(messages = [], originalToAlias = null) {
   const input = [];
-  for (const m of messages) {
+  for (const m of Array.isArray(messages) ? messages : []) {
     if (!m) continue;
+    if (m.role === "system" || m.role === "developer") {
+      continue;
+    }
     if (m.role === "tool") {
       input.push({
         type: "function_call_output",
@@ -509,7 +582,12 @@ function transformToResponsesInput(messages = [], originalToAlias = null) {
       continue;
     }
     if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
-      if (m.content) input.push({ role: "assistant", content: extractContent(m.content) });
+      if (m.content) {
+        input.push({
+          role: "assistant",
+          content: transformResponsesContent(m.content, "assistant"),
+        });
+      }
       for (const tc of m.tool_calls) {
         const fn = tc.function || {};
         const rawName = fn.name || "unknown";
@@ -524,9 +602,26 @@ function transformToResponsesInput(messages = [], originalToAlias = null) {
       }
       continue;
     }
-    input.push({ role: m.role || "user", content: extractContent(m.content) });
+    const role = m.role || "user";
+    input.push({ role, content: transformResponsesContent(m.content, role) });
   }
   return input;
+}
+
+function extractSystemInstructions(messages = [], explicitInstructions = "", placeholderNote = "") {
+  const parts = [];
+  if (typeof explicitInstructions === "string" && explicitInstructions.trim()) {
+    parts.push(explicitInstructions.trim());
+  }
+  for (const m of Array.isArray(messages) ? messages : []) {
+    if (!m || (m.role !== "system" && m.role !== "developer")) continue;
+    const text = extractContent(m.content).trim();
+    if (text) parts.push(text);
+  }
+  if (placeholderNote) {
+    parts.push(placeholderNote);
+  }
+  return parts.join("\n\n");
 }
 
 function transformChatMessages(messages = [], originalToAlias = null, placeholderNote = "") {
@@ -556,8 +651,14 @@ function transformChatMessages(messages = [], originalToAlias = null, placeholde
 
   if (placeholderNote) {
     const first = out[0];
-    if (first?.role === "system" && typeof first.content === "string") {
-      out[0] = { ...first, content: `${first.content}\n\n${placeholderNote}` };
+    if (first?.role === "system" || first?.role === "developer") {
+      if (typeof first.content === "string") {
+        out[0] = { ...first, content: `${first.content}\n\n${placeholderNote}` };
+      } else if (Array.isArray(first.content)) {
+        out[0] = { ...first, content: [...first.content, { type: "text", text: `\n\n${placeholderNote}` }] };
+      } else {
+        out.unshift({ role: "system", content: placeholderNote });
+      }
     } else {
       out.unshift({ role: "system", content: placeholderNote });
     }
@@ -569,12 +670,10 @@ function buildUpstreamPayload(body, targetModel, useResponses) {
   const requestedTokens =
     body.max_output_tokens ?? body.max_completion_tokens ?? body.max_tokens;
   const maxTokens = effectiveMaxTokens(requestedTokens, targetModel, body);
-  const { tools, appended, aliasToOriginal, originalToAlias } = prepareToolsWithFingerprint(
+  const { tools, placeholderNote, aliasToOriginal, originalToAlias } = prepareToolsWithFingerprint(
     body.tools,
     useResponses
   );
-  const placeholderNote = buildPlaceholderNote(appended);
-
   if (useResponses) {
     const upstreamBody = {
       model: targetModel,
@@ -584,14 +683,16 @@ function buildUpstreamPayload(body, targetModel, useResponses) {
       tools,
       tool_choice: "auto",
     };
-    if (placeholderNote) {
-      upstreamBody.instructions =
-        typeof body.instructions === "string" && body.instructions.trim()
-          ? `${body.instructions}\n\n${placeholderNote}`
-          : placeholderNote;
-    } else if (typeof body.instructions === "string" && body.instructions.trim()) {
-      upstreamBody.instructions = body.instructions;
+    const instructions = extractSystemInstructions(
+      body.messages,
+      body.instructions,
+      placeholderNote
+    );
+    if (instructions) {
+      upstreamBody.instructions = instructions;
     }
+    if (typeof body.temperature === "number") upstreamBody.temperature = body.temperature;
+    if (typeof body.top_p === "number") upstreamBody.top_p = body.top_p;
     return { upstreamBody, aliasToOriginal };
   }
 
@@ -603,6 +704,11 @@ function buildUpstreamPayload(body, targetModel, useResponses) {
     max_tokens: maxTokens,
     tools,
   };
+  if (typeof body.temperature === "number") upstreamBody.temperature = body.temperature;
+  if (typeof body.top_p === "number") upstreamBody.top_p = body.top_p;
+  if (body.stop !== undefined) upstreamBody.stop = body.stop;
+  if (body.response_format !== undefined) upstreamBody.response_format = body.response_format;
+  if (body.reasoning_effort !== undefined) upstreamBody.reasoning_effort = body.reasoning_effort;
 
   // Upstream v2 rejects tool_choice: "none" with 403 FreeTierError.
   if (body.tool_choice && body.tool_choice !== "none") {
@@ -663,13 +769,18 @@ const SESSION_TTL_MS = 3 * 3600 * 1000;
 
 function getPersistentSessionId(req, body) {
   const headers = req?.headers || {};
-  const headerKey =
+  const rawHeaderKey =
     headers["x-opencode-session"] ||
     headers["x-opencode-session-id"] ||
     headers["x-session-id"] ||
     headers["session-id"] ||
     headers["x-conversation-id"] ||
     headers["x-9r-session-id"];
+  const headerKey = Array.isArray(rawHeaderKey)
+    ? String(rawHeaderKey[0] || "").slice(0, 256)
+    : rawHeaderKey
+      ? String(rawHeaderKey).slice(0, 256)
+      : "";
   // Fast path (common case): a session header is present, so no message
   // hashing is needed at all. The conv-signature hash below only runs for
   // headerless clients, and slices BEFORE stringify so a huge system prompt
@@ -678,7 +789,10 @@ function getPersistentSessionId(req, body) {
   if (!lookupKey) {
     const msgs = body && Array.isArray(body.messages) ? body.messages : [];
     if (msgs.length > 0) {
-      const sig = shortText(msgs[0]?.content, 1000) + "::" + shortText(msgs[1]?.content, 1000);
+      const sig =
+        messageSignatureSample(msgs[0]?.content, 1000) +
+        "::" +
+        messageSignatureSample(msgs[1]?.content, 1000);
       if (sig !== "::") {
         lookupKey =
           "conv:" + crypto.createHash("sha256").update(sig).digest("hex").slice(0, 20);
@@ -727,19 +841,34 @@ function readRequestBody(req, maxBytes = MAX_BODY_BYTES) {
     const chunks = [];
     let totalBytes = 0;
     let done = false;
+    const cleanup = () => {
+      if (typeof req.off === "function") {
+        req.off("error", onError);
+        req.off("data", onData);
+        req.off("end", onEnd);
+      } else if (typeof req.removeListener === "function") {
+        req.removeListener("error", onError);
+        req.removeListener("data", onData);
+        req.removeListener("end", onEnd);
+      }
+    };
 
-    req.on("error", (err) => {
+    const onError = (err) => {
       if (done) return;
       done = true;
+      cleanup();
       reject(err);
-    });
+    };
 
-    req.on("data", (chunk) => {
+    const onData = (chunk) => {
       if (done) return;
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       totalBytes += buf.length;
       if (totalBytes > maxBytes) {
         done = true;
+        chunks.length = 0;
+        cleanup();
+        if (typeof req.pause === "function") req.pause();
         const err = new Error(`Request body exceeds limit of ${maxBytes} bytes`);
         err.statusCode = 413;
         err.code = "payload_too_large";
@@ -747,13 +876,18 @@ function readRequestBody(req, maxBytes = MAX_BODY_BYTES) {
         return;
       }
       chunks.push(buf);
-    });
+    };
 
-    req.on("end", () => {
+    const onEnd = () => {
       if (done) return;
       done = true;
+      cleanup();
       resolve(Buffer.concat(chunks).toString("utf8"));
-    });
+    };
+
+    req.on("error", onError);
+    req.on("data", onData);
+    req.on("end", onEnd);
   });
 }
 
@@ -766,38 +900,58 @@ function handleRequest(req, res) {
     console.warn("[opencode-free-bridge] response stream error:", err.message);
   });
 
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  const reqOrigin = req.headers?.origin || "";
+  const configuredOrigin = process.env.CORS_ORIGIN !== undefined ? process.env.CORS_ORIGIN : CORS_ORIGIN;
+  if (configuredOrigin === "*") {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  } else if (configuredOrigin) {
+    const allowed = configuredOrigin.split(",").map((s) => s.trim()).filter(Boolean);
+    if (allowed.includes(reqOrigin)) {
+      res.setHeader("Access-Control-Allow-Origin", reqOrigin);
+      res.setHeader("Vary", "Origin");
+    }
+  } else if (isLocalOrigin(reqOrigin)) {
+    res.setHeader("Access-Control-Allow-Origin", reqOrigin);
+    res.setHeader("Vary", "Origin");
+  }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Requested-With, X-Session-Id, Session-Id, X-Conversation-Id, X-9r-Session-Id, X-OpenCode-Session, X-OpenCode-Session-Id, X-Session-Affinity, X-OpenCode-Client, X-OpenCode-Project"
+  );
 
   if (req.method === "OPTIONS") {
     res.writeHead(204);
     return res.end();
   }
 
-  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-  const pathname = url.pathname.replace(/\/+$/, "");
+  const rawUrl = req.url || "/";
+  const qIdx = rawUrl.indexOf("?");
+  const rawPath = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
+  const pathname = rawPath.length > 1 && rawPath.endsWith("/") ? rawPath.replace(/\/+$/, "") : rawPath;
 
   // Health check
-  if (pathname === "" || pathname === "/health") {
+  if (pathname === "" || pathname === "/" || pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(
-      JSON.stringify({
-        status: "ok",
-        provider: "opencode-free-bridge",
-        version: VERSION,
-        discoveredModels: activeModels.length,
-      })
-    );
+    return res.end(cachedHealthPayload);
   }
 
   // Model list (triggers async re-discovery when the hourly TTL expired)
   if (req.method === "GET" && (pathname === "/v1/models" || pathname === "/models")) {
+    if (activeModels.length === 0) {
+      discoverModels()
+        .catch(() => {})
+        .finally(() => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(cachedModelsPayload);
+        });
+      return;
+    }
     if (Date.now() - lastDiscoveryTime > DISCOVERY_TTL_MS) {
       discoverModels().catch(() => {});
     }
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ object: "list", data: activeModels }));
+    return res.end(cachedModelsPayload);
   }
 
   // Chat completions
@@ -808,7 +962,7 @@ function handleRequest(req, res) {
         bodyText = await readRequestBody(req);
       } catch (err) {
         if (err.statusCode === 413) {
-          res.writeHead(413, { "Content-Type": "application/json" });
+          res.writeHead(413, { "Content-Type": "application/json", "Connection": "close" });
           res.end(
             JSON.stringify({
               error: {
@@ -818,7 +972,9 @@ function handleRequest(req, res) {
               },
             })
           );
-          req.destroy();
+          res.once("finish", () => {
+            if (typeof req.destroy === "function") req.destroy();
+          });
           return;
         }
         if (!res.headersSent && !res.writableEnded) {
@@ -962,17 +1118,19 @@ function handleRequest(req, res) {
           } catch {
             errJson = { message: errText };
           }
-          // If upstream rejects with 403 (e.g. OpenCode changed its gate again),
-          // immediately check GitHub for a hotfix release (max once per 5 min).
-          if (upstreamRes.status === 403 && Date.now() - lastUpdateCheckTime > 5 * 60 * 1000) {
-            checkAndApplyUpdate().catch(() => {});
+          const errType = errJson.error?.type || "upstream_error";
+          const rawMsg =
+            errJson.error?.message || errJson.message || `Upstream error ${upstreamRes.status}`;
+          const isGateErr = isFreeTierCliGateError(upstreamRes.status, errType, rawMsg);
+          if (isGateErr) {
+            console.warn(`[opencode-free-bridge] Upstream CLI gate rejected request (${upstreamRes.status}): ${rawMsg} — ${UPDATE_HINT}`);
           }
           res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
           return res.end(
             JSON.stringify({
               error: {
-                message: errJson.error?.message || errJson.message || `Upstream error ${upstreamRes.status}`,
-                type: errJson.error?.type || "upstream_error",
+                message: isGateErr ? `${rawMsg} (${UPDATE_HINT})` : rawMsg,
+                type: errType,
                 code: upstreamRes.status,
               },
             })
@@ -1105,24 +1263,7 @@ function handleRequest(req, res) {
               } catch {}
             };
 
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) {
-                buffer += decoder.decode();
-                if (buffer.trim()) {
-                  for (const line of buffer.replace(/\r\n/g, "\n").split("\n")) {
-                    handleResponsesStreamLine(line);
-                  }
-                }
-                break;
-              }
-              buffer += decoder.decode(value, { stream: true });
-              const lines = buffer.replace(/\r\n/g, "\n").split("\n");
-              buffer = lines.pop() ?? "";
-              for (const line of lines) {
-                handleResponsesStreamLine(line);
-              }
-            }
+            await consumeSseLines(reader, decoder, handleResponsesStreamLine);
 
             const finalFinishReason = upstreamFinishReason || (hasToolCalls ? "tool_calls" : "stop");
             res.write(
@@ -1150,6 +1291,7 @@ function handleRequest(req, res) {
             return res.end();
           } else {
             // Chat Completions API SSE stream
+            const hasAliases = aliasToOriginal.size > 0;
             const handleChatStreamLine = (line) => {
               if (!line.startsWith("data: ")) return;
               const raw = line.slice(6).trim();
@@ -1158,13 +1300,19 @@ function handleRequest(req, res) {
                 res.write("data: [DONE]\n\n");
                 return;
               }
+              // Zero-parse fast path: when no client tools are aliased and the chunk
+              // carries no `"reasoning":` field to normalize, forward raw SSE bytes directly.
+              if (!hasAliases && !raw.includes('"reasoning"')) {
+                res.write(`data: ${raw}\n\n`);
+                return;
+              }
               try {
                 const chunk = JSON.parse(raw);
                 const delta = chunk.choices?.[0]?.delta;
                 if (delta && delta.reasoning && !delta.reasoning_content) {
                   delta.reasoning_content = delta.reasoning;
                 }
-                if (Array.isArray(delta?.tool_calls) && aliasToOriginal.size > 0) {
+                if (hasAliases && Array.isArray(delta?.tool_calls)) {
                   for (const tc of delta.tool_calls) {
                     if (tc.function?.name) {
                       tc.function.name = restoreClientToolName(tc.function.name, aliasToOriginal);
@@ -1177,24 +1325,7 @@ function handleRequest(req, res) {
               }
             };
 
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) {
-                buffer += decoder.decode();
-                if (buffer.trim()) {
-                  for (const line of buffer.replace(/\r\n/g, "\n").split("\n")) {
-                    handleChatStreamLine(line);
-                  }
-                }
-                break;
-              }
-              buffer += decoder.decode(value, { stream: true });
-              const lines = buffer.replace(/\r\n/g, "\n").split("\n");
-              buffer = lines.pop() ?? "";
-              for (const line of lines) {
-                handleChatStreamLine(line);
-              }
-            }
+            await consumeSseLines(reader, decoder, handleChatStreamLine);
             return res.end();
           }
         }
@@ -1312,24 +1443,7 @@ function handleRequest(req, res) {
           } catch {}
         };
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) {
-            buffer += decoder.decode();
-            if (buffer.trim()) {
-              for (const line of buffer.replace(/\r\n/g, "\n").split("\n")) {
-                handleNonStreamLine(line);
-              }
-            }
-            break;
-          }
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.replace(/\r\n/g, "\n").split("\n");
-          buffer = lines.pop() ?? "";
-          for (const line of lines) {
-            handleNonStreamLine(line);
-          }
-        }
+        await consumeSseLines(reader, decoder, handleNonStreamLine);
 
         const validToolCalls = toolCalls.filter(Boolean);
         const messageObj = { role: "assistant", content: assistantText || null };
@@ -1406,6 +1520,47 @@ function handleRequest(req, res) {
   res.end(JSON.stringify({ error: { message: "Not found", type: "invalid_request_error" } }));
 }
 
+async function consumeSseLines(reader, decoder, onLine) {
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      buffer += decoder.decode();
+      if (buffer.trim()) {
+        let start = 0;
+        for (let i = 0; i < buffer.length; i++) {
+          if (buffer.charCodeAt(i) === 10) {
+            const line =
+              i > start && buffer.charCodeAt(i - 1) === 13
+                ? buffer.slice(start, i - 1)
+                : buffer.slice(start, i);
+            onLine(line);
+            start = i + 1;
+          }
+        }
+        if (start < buffer.length) {
+          const tail = buffer.endsWith("\r") ? buffer.slice(start, -1) : buffer.slice(start);
+          onLine(tail);
+        }
+      }
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    let start = 0;
+    for (let i = 0; i < buffer.length; i++) {
+      if (buffer.charCodeAt(i) === 10) {
+        const line =
+          i > start && buffer.charCodeAt(i - 1) === 13
+            ? buffer.slice(start, i - 1)
+            : buffer.slice(start, i);
+        onLine(line);
+        start = i + 1;
+      }
+    }
+    buffer = start === 0 ? buffer : buffer.slice(start);
+  }
+}
+
 const server = http.createServer(handleRequest);
 
 // Only auto-start when executed directly (`node server.js`), so unit tests can
@@ -1425,11 +1580,11 @@ module.exports = {
   MODEL_MAP,
   FINGERPRINT_TOOL_NAMES,
   FINGERPRINT_TOOL_DEFINITIONS,
+  CANONICAL_TOOLS_CHAT,
+  CANONICAL_TOOLS_RESPONSES,
   MAX_SESSIONS,
   SESSION_TTL_MS,
   sessionCache,
-  isNewerVersion,
-  checkAndApplyUpdate,
   createId,
   isValidV2UserAgent,
   normalizeModel,
@@ -1450,13 +1605,23 @@ module.exports = {
   handleRequest,
   server,
   shortText,
+  messageSignatureSample,
+  transformResponsesContent,
+  extractSystemInstructions,
+  isLocalOrigin,
+  isFreeTierCliGateError,
+  consumeSseLines,
   readRequestBody,
   refreshCliVersion,
   __getUserAgent: () => currentUserAgent,
   DISCOVERY_TTL_MS,
   CLI_VERSION_TTL_MS,
   __setLastDiscoveryTime: (v) => { lastDiscoveryTime = v; },
-  __getDiscoveryState: () => ({ inFlight: !!discoveryInFlight, lastDiscoveryTime }),
+  __setActiveModels: (m) => {
+    activeModels = Array.isArray(m) ? m : [];
+    rebuildDiscoveryPayloads();
+  },
+  __getDiscoveryState: () => ({ inFlight: !!discoveryInFlight, lastDiscoveryTime, activeModels }),
   __setLastCliVersionCheckTime: (v) => { lastCliVersionCheckTime = v; },
   __getCliVersionState: () => ({ lastCliVersionCheckTime }),
 };

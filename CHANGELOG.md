@@ -1,5 +1,40 @@
 # Changelog
 
+## [1.5.3] — 2026-10-15
+
+### Pruned, Hardened & Deep-Optimized
+
+- **Removed runtime self-updater bloat (`FIND-02`)**: deleted `checkAndApplyUpdate()`,
+  `isNewerVersion()`, `fs`/`path`/`child_process`/`vm` imports, and `AUTO_UPDATE`
+  from `server.js`. Updating is handled cleanly by `install.sh` or `git pull`.
+- **Zero-allocation hot paths**:
+  - Pre-computed and froze `CANONICAL_TOOLS_CHAT`, `CANONICAL_TOOLS_RESPONSES`,
+    `FINGERPRINT_PARAM_STRINGS`, and `DEFAULT_PLACEHOLDER_NOTE` at module load so
+    tool-less or standard requests allocate zero tool objects/maps.
+  - Pooled `crypto.randomFillSync` (3.5 KB buffer, 256 IDs per syscall) in
+    `createId()`.
+  - Pre-serialized `/health` and `/v1/models` JSON payloads on discovery change
+    and replaced `new URL()` + regex path parsing with direct string indexing.
+  - Added zero-split `consumeSseLines()` scanner and zero-parse SSE passthrough
+    fast path when no tool aliases or `reasoning` field normalization are needed.
+- **Responses API system/developer instructions & multimodal inputs (`FIND-01`, `FIND-04`)**:
+  extracts `system` and `developer` messages from `body.messages` into
+  `upstreamBody.instructions` alongside `placeholderNote`, preserves multimodal
+  `image_url` / `input_image` / `input_file` parts, and forwards `temperature`,
+  `top_p`, `stop`, `response_format`, and `reasoning_effort`.
+- **Chunked 413 stream cleanup (`FIND-03`)**: when a streaming request body
+  exceeds `MAX_BODY_BYTES`, `readRequestBody` detaches listeners, pauses the
+  stream immediately, and destroys the socket without calling `req.resume()`.
+- **Localhost-scoped CORS (`FIND-05`)**: restricts `Access-Control-Allow-Origin`
+  to `localhost` / `127.0.0.1` / `[::1]` by default (configurable via
+  `CORS_ORIGIN`) so arbitrary third-party websites cannot drain local IP quota.
+- **Collision-resistant headerless session hashing (`FIND-06`)**: samples both
+  head and tail plus total length (`messageSignatureSample`) so conversations
+  sharing a long (>1000 char) system prompt prefix do not collide.
+- **Reasoning hint & installer quoting (`FIND-04`, `FIND-07`)**: added
+  `deepseek` to `REASONING_MODEL_HINTS` in `token-budget.js` and hardened path
+  quoting in `install.sh`.
+
 ## [1.5.2] — 2026-10-15
 
 ### Performance — 4 hot-path optimizations (zero-deps, all covered by `test/optimizations.test.js`)
