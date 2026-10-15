@@ -20,7 +20,6 @@ describe("token-budget", () => {
       "longcat-2.5-preview-free",
       "cat-jam-free",
       "big-pickle",
-      "ling-3.1-flash-free",
       "step-5-preview-free",
     ];
     for (const model of reasoningModels) {

@@ -43,7 +43,6 @@ const REASONING_MODEL_HINTS = [
   "longcat",
   "cat-jam",
   "pickle",
-  "ling",
   "step-",
 ];
 

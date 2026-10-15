@@ -73,21 +73,11 @@ function createId(descending, timestamp = Date.now()) {
   return time + randomStr;
 }
 
-// --- Known Fallback Models ---
-const FALLBACK_MODELS = [
-  { id: "muse-spark-1.3-contributor-free", object: "model", owned_by: "opencode" },
-  { id: "muse-spark-1.2-contributor-free", object: "model", owned_by: "opencode" },
-  { id: "mimo-v2.6-flash-free",          object: "model", owned_by: "opencode" },
-  { id: "nemotron-3.5-lightning-free",   object: "model", owned_by: "opencode" },
-  { id: "step-5-preview-free",           object: "model", owned_by: "opencode" },
-  { id: "ling-3.1-flash-free",           object: "model", owned_by: "opencode" },
-  { id: "space-bunny-free",              object: "model", owned_by: "opencode" },
-  { id: "cat-jam-free",                  object: "model", owned_by: "opencode" },
-  { id: "longcat-2.5-preview-free",      object: "model", owned_by: "opencode" },
-  { id: "big-pickle",                    object: "model", owned_by: "opencode" },
-];
-
-let activeModels = [...FALLBACK_MODELS];
+// Live model list, discovered from upstream at boot and refreshed hourly.
+// No hardcoded fallback: an empty list honestly means "upstream not reached
+// yet", so gateways/harnesses apply their own fallback instead of being
+// served a stale lie.
+let activeModels = [];
 let lastDiscoveryTime = 0;
 const DISCOVERY_TTL_MS = 60 * 60 * 1000; // Auto-refresh every 1 hour
 let lastUpdateCheckTime = 0;
@@ -211,7 +201,7 @@ async function discoverModels() {
       return;
     }
   } catch (err) {
-    console.warn(`[opencode-bridge] Auto-discovery warning: ${err.message}. Using cached/fallback models.`);
+    console.warn(`[opencode-bridge] Auto-discovery warning: ${err.message}. Model list stays empty until upstream answers.`);
   }
 }
 
@@ -231,10 +221,11 @@ const MODEL_MAP = {
   "nemotron-3.5":               "nemotron-3.5-lightning-free",
   "step":                       "step-5-preview-free",
   "step-5":                     "step-5-preview-free",
-  "ling":                       "ling-3.1-flash-free",
-  "ling-3":                     "ling-3.1-flash-free",
-  "ling-3.0-flash-fin-free":    "ling-3.1-flash-free",
-  "ling-3.1":                   "ling-3.1-flash-free",
+  "deepseek":                   "deepseek-v4.1-flash-free",
+  "deepseek-v4":                "deepseek-v4.1-flash-free",
+  "deepseek-v4.1":              "deepseek-v4.1-flash-free",
+  "big-pickle":                 "big-pickle",
+  "pickle":                     "big-pickle",
   "space-bunny":                "space-bunny-free",
   "cat-jam":                    "cat-jam-free",
   "longcat":                    "longcat-2.5-preview-free",
@@ -712,10 +703,10 @@ function readRequestBody(req, maxBytes = MAX_BODY_BYTES) {
 // --- HTTP Server ---
 function handleRequest(req, res) {
   req.on("error", (err) => {
-    console.warn("[bridge] request stream error:", err.message);
+    console.warn("[opencode-free-bridge] request stream error:", err.message);
   });
   res.on("error", (err) => {
-    console.warn("[bridge] response stream error:", err.message);
+    console.warn("[opencode-free-bridge] response stream error:", err.message);
   });
 
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -743,7 +734,7 @@ function handleRequest(req, res) {
     );
   }
 
-  // Model list (triggers async auto-discovery if cache expired)
+  // Model list (triggers async re-discovery when the hourly TTL expired)
   if (req.method === "GET" && (pathname === "/v1/models" || pathname === "/models")) {
     if (Date.now() - lastDiscoveryTime > DISCOVERY_TTL_MS) {
       discoverModels().catch(() => {});
@@ -1336,7 +1327,7 @@ function handleRequest(req, res) {
           }
           return res.end();
         }
-        console.error("[bridge] exception:", err);
+        console.error("[opencode-free-bridge] exception:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           return res.end(
@@ -1363,17 +1354,17 @@ const server = http.createServer(handleRequest);
 // Only auto-start when executed directly (`node server.js`), so unit tests can
 // require("./server") without binding the default port or starting timers.
 if (require.main === module) {
-  discoverModels().finally(() => {
-    server.listen(PORT, HOST, () => {
-      console.log(`[opencode-free-bridge] v${VERSION} listening on http://${HOST}:${PORT}`);
-    });
+  server.listen(PORT, HOST, () => {
+    console.log(`[opencode-free-bridge] v${VERSION} listening on http://${HOST}:${PORT}`);
   });
+  // Discovery runs in background: /v1/models is live as soon as upstream
+  // answers. Boot never blocks on network.
+  discoverModels().catch(() => {});
   setInterval(discoverModels, DISCOVERY_TTL_MS).unref();
 }
 
 module.exports = {
   VERSION,
-  FALLBACK_MODELS,
   MODEL_MAP,
   FINGERPRINT_TOOL_NAMES,
   FINGERPRINT_TOOL_DEFINITIONS,

@@ -126,7 +126,7 @@ async function probe(model) {
   const models = await listModels();
   if (models.length === 0) {
     console.log(`  ${warn("WARN")} no models listed at /v1/models — upstream may be unreachable`);
-    console.log(`  ${C.dim}the bridge falls back to its built-in list; try again shortly${C.reset}\n`);
+    console.log(`  ${C.dim}wait for discovery to complete, then try again${C.reset}\n`);
     process.exit(1);
   }
 

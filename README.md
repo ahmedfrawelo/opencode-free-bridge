@@ -10,7 +10,6 @@ Exposes a local `/v1/chat/completions` endpoint that any OpenAI-compatible clien
 - **Dual-protocol routing** — Meta Muse models are routed to the Responses API, everything else to Chat Completions.
 - **Reasoning-aware token budgeting** — reasoning tokens count against the output budget. The bridge enforces a floor so short requests still return content instead of an empty response.
 - **Reasoning content support** — thinking models preserve their reasoning in `reasoning_content` for both streaming and non-streaming clients.
-- **Resilient fallback** — falls back to a built-in model list when the upstream catalog is unreachable.
 - **Zero dependencies** — Node.js standard library only.
 
 ## Requirements
@@ -126,7 +125,7 @@ The list is discovered from upstream at runtime. As of the last update:
 | `cat-jam-free` | — |
 | `longcat-2.5-preview-free` | LongCat 2.5 Preview |
 | `space-bunny-free` | Space Bunny Preview |
-| `ling-3.1-flash-free` | Frequently rate-limited upstream |
+| `deepseek-v4.1-flash-free` | DeepSeek V4.1 Flash |
 | `step-5-preview-free` | Frequently rate-limited upstream |
 
 Fetch the live list:
@@ -145,7 +144,7 @@ The bridge enforces a floor on the output budget:
 
 | Request targets | Effective `max_tokens` |
 |---|---|
-| Reasoning model (Muse, MiMo, Nemotron, LongCat, cat-jam, big-pickle, ling, step) | `max(requested, 1024) + 4096` |
+| Reasoning model (Muse, MiMo, Nemotron, LongCat, cat-jam, big-pickle, step) | `max(requested, 1024) + 4096` |
 | Any model with `reasoning_effort` set | same as above |
 | All other models | `max(requested, 512)` |
 

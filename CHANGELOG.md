@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.5.1] — 2026-10-15
+
+### Removed — hardcoded model fallback
+
+- **No more `FALLBACK_MODELS` / built-in list.** `server.js` starts with an
+  empty model list and serves only live discovery results. An empty
+  `/v1/models` honestly means "upstream not reached yet", so gateways and
+  harnesses apply their own fallback instead of being served a stale list.
+- Removed retired `ling-3.1-flash-free` aliases (upstream retired the model),
+  removed its hint from `token-budget.js`, and replaced it with
+  `deepseek-v4.1-flash-free` in `README.md`.
+- Added `deepseek` / `big-pickle` shorthand aliases to `MODEL_MAP`.
+- Unified log prefix to `[opencode-free-bridge]`, fixed stale comments
+  referencing the removed cache/fallback.
+- Boot no longer blocks on network: `server.listen` first, discovery runs in
+  background and refreshes hourly.
+
 ## [1.5.0] — 2026-10-14
 
 ### Fixed — OpenCode v2 `/inference/v1` gate migration (`403 FreeTierError`, 9router#4837)
