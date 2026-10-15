@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.5.2] — 2026-10-15
+
+### Performance — 4 hot-path optimizations (zero-deps, all covered by `test/optimizations.test.js`)
+
+- **Single-flight discovery**: 50 parallel `/v1/models` hits after TTL expiry
+  share one upstream fetch (was: 50 parallel fetches = thundering herd).
+- **Discovery no longer waits on the CLI version feed**: feed refreshes in
+  parallel fire-and-forget and is cached 6h (was: every hourly discovery
+  blocked up to 5s on the Atom feed).
+- **Session fast path**: requests carrying a session header skip message
+  hashing entirely; headerless fallback slices *before* stringify via new
+  `shortText()` so a multi-MB system prompt is never serialized for a hash.
+- **Early 413 reject**: bodies declaring `content-length` over the limit are
+  refused without buffering a byte.
+
+Measured: 50 parallel GETs served in 0.22s with 1 upstream fetch;
+header-path session lookups with 5MB messages in ~6ms.
+
 ## [1.5.1] — 2026-10-15
 
 ### Removed — hardcoded model fallback

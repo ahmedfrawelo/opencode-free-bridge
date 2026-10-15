@@ -82,6 +82,13 @@ let lastDiscoveryTime = 0;
 const DISCOVERY_TTL_MS = 60 * 60 * 1000; // Auto-refresh every 1 hour
 let lastUpdateCheckTime = 0;
 let updateInProgress = false;
+// Single-flight: concurrent /v1/models hits after TTL expiry share one upstream
+// fetch instead of stampeding (50 parallel GETs = 1 upstream call, not 50).
+let discoveryInFlight = null;
+// CLI version feed is slow (5s timeout) and changes rarely: cache 6h, refresh
+// in parallel so model discovery never waits on it.
+let lastCliVersionCheckTime = 0;
+const CLI_VERSION_TTL_MS = 6 * 60 * 60 * 1000;
 
 function isNewerVersion(currentVer, remoteVer) {
   const pa = String(currentVer || "").replace(/^v/i, "").split(".").map((n) => parseInt(n, 10) || 0);
@@ -151,6 +158,9 @@ async function checkAndApplyUpdate() {
 
 async function refreshCliVersion() {
   if (process.env.OPENCODE_USER_AGENT) return;
+  const now = Date.now();
+  if (now - lastCliVersionCheckTime < CLI_VERSION_TTL_MS) return;
+  lastCliVersionCheckTime = now;
   try {
     const res = await fetch(OPENCODE_RELEASES_ATOM_URL, {
       signal: AbortSignal.timeout(5000),
@@ -166,11 +176,16 @@ async function refreshCliVersion() {
   }
 }
 
-// Auto-discovery from OpenCode upstream gateway
+// Auto-discovery from OpenCode upstream gateway.
+// Single-flight: concurrent callers share one in-flight fetch.
+// The CLI-version feed refreshes in parallel (fire-and-forget) so a slow
+// 5s feed never delays the model list.
 async function discoverModels() {
-  await refreshCliVersion();
-  checkAndApplyUpdate().catch(() => {});
-  try {
+  if (discoveryInFlight) return discoveryInFlight;
+  discoveryInFlight = (async () => {
+    refreshCliVersion().catch(() => {});
+    checkAndApplyUpdate().catch(() => {});
+    try {
     const res = await fetch(OPENCODE_MODELS_URL, {
       headers: {
         "Authorization": "Bearer public",
@@ -200,8 +215,14 @@ async function discoverModels() {
       console.log(`[opencode-bridge] Auto-discovered ${activeModels.length} free models from upstream gateway.`);
       return;
     }
-  } catch (err) {
-    console.warn(`[opencode-bridge] Auto-discovery warning: ${err.message}. Model list stays empty until upstream answers.`);
+    } catch (err) {
+      console.warn(`[opencode-bridge] Auto-discovery warning: ${err.message}. Model list stays empty until upstream answers.`);
+    }
+  })();
+  try {
+    return await discoveryInFlight;
+  } finally {
+    discoveryInFlight = null;
   }
 }
 
@@ -450,6 +471,30 @@ function extractContent(content) {
   return content ? JSON.stringify(content) : "";
 }
 
+// First-N-chars text without ever serializing the whole value: strings are
+// sliced directly, arrays join only text parts up to the limit, objects fall
+// back to a bounded stringify. Used for the headerless session signature so
+// a multi-MB system prompt is never JSON.stringified just for a hash.
+function shortText(content, limit = 1000) {
+  if (typeof content === "string") return content.slice(0, limit);
+  if (Array.isArray(content)) {
+    let out = "";
+    for (const p of content) {
+      if (out.length >= limit) break;
+      if (typeof p === "string") out += p;
+      else if (p?.type === "text" && typeof p.text === "string") out += p.text;
+      else if (p?.text) out += String(p.text);
+    }
+    return out.slice(0, limit);
+  }
+  if (!content) return "";
+  try {
+    return JSON.stringify(content).slice(0, limit);
+  } catch {
+    return String(content).slice(0, limit);
+  }
+}
+
 // Convert OpenAI messages to OpenCode input format (for Responses API)
 function transformToResponsesInput(messages = [], originalToAlias = null) {
   const input = [];
@@ -625,18 +670,21 @@ function getPersistentSessionId(req, body) {
     headers["session-id"] ||
     headers["x-conversation-id"] ||
     headers["x-9r-session-id"];
-  const msgs = body && Array.isArray(body.messages) ? body.messages : [];
-  let convSig = "";
-  if (msgs.length > 0) {
-    const m0 = msgs[0] ? extractContent(msgs[0].content) || JSON.stringify(msgs[0]) : "";
-    const m1 = msgs[1] ? extractContent(msgs[1].content) || JSON.stringify(msgs[1]) : "";
-    convSig = crypto
-      .createHash("sha256")
-      .update(String(m0).slice(0, 1000) + "::" + String(m1).slice(0, 1000))
-      .digest("hex")
-      .slice(0, 20);
+  // Fast path (common case): a session header is present, so no message
+  // hashing is needed at all. The conv-signature hash below only runs for
+  // headerless clients, and slices BEFORE stringify so a huge system prompt
+  // never gets serialized just to take its first 1000 chars.
+  let lookupKey = headerKey ? "hdr:" + headerKey : null;
+  if (!lookupKey) {
+    const msgs = body && Array.isArray(body.messages) ? body.messages : [];
+    if (msgs.length > 0) {
+      const sig = shortText(msgs[0]?.content, 1000) + "::" + shortText(msgs[1]?.content, 1000);
+      if (sig !== "::") {
+        lookupKey =
+          "conv:" + crypto.createHash("sha256").update(sig).digest("hex").slice(0, 20);
+      }
+    }
   }
-  const lookupKey = headerKey ? "hdr:" + headerKey : convSig ? "conv:" + convSig : null;
   const now = Date.now();
   if (lookupKey && sessionCache.has(lookupKey)) {
     const entry = sessionCache.get(lookupKey);
@@ -666,6 +714,15 @@ function getPersistentSessionId(req, body) {
 }
 
 function readRequestBody(req, maxBytes = MAX_BODY_BYTES) {
+  // Early reject: if the client declares a huge body, refuse without reading
+  // a single byte instead of buffering up to the limit first.
+  const declared = parseInt(req?.headers?.["content-length"] || "", 10);
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    const err = new Error(`Request body exceeds limit of ${maxBytes} bytes`);
+    err.statusCode = 413;
+    err.code = "payload_too_large";
+    return Promise.reject(err);
+  }
   return new Promise((resolve, reject) => {
     const chunks = [];
     let totalBytes = 0;
@@ -1392,4 +1449,14 @@ module.exports = {
   discoverModels,
   handleRequest,
   server,
+  shortText,
+  readRequestBody,
+  refreshCliVersion,
+  __getUserAgent: () => currentUserAgent,
+  DISCOVERY_TTL_MS,
+  CLI_VERSION_TTL_MS,
+  __setLastDiscoveryTime: (v) => { lastDiscoveryTime = v; },
+  __getDiscoveryState: () => ({ inFlight: !!discoveryInFlight, lastDiscoveryTime }),
+  __setLastCliVersionCheckTime: (v) => { lastCliVersionCheckTime = v; },
+  __getCliVersionState: () => ({ lastCliVersionCheckTime }),
 };
