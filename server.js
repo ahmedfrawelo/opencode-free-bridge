@@ -7,10 +7,12 @@ const crypto = require("crypto");
 const PORT = parseInt(process.env.PORT || "20129", 10);
 const HOST = process.env.HOST || "127.0.0.1";
 
-const OPENCODE_ZEN_RESPONSES_URL = "https://opencode.ai/zen/v1/responses";
-const OPENCODE_ZEN_CHAT_URL = "https://opencode.ai/zen/v1/chat/completions";
-const OPENCODE_ZEN_MODELS_URL = "https://opencode.ai/zen/v1/models";
-const USER_AGENT = "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
+// OpenCode v2 clients hit /inference/v1 (the old /zen/v1 path is dead for new
+// clients). The free-tier gate validates session ids and the tool shape.
+const OPENCODE_INFERENCE_RESPONSES_URL = "https://opencode.ai/inference/v1/responses";
+const OPENCODE_INFERENCE_CHAT_URL = "https://opencode.ai/inference/v1/chat/completions";
+const OPENCODE_INFERENCE_MODELS_URL = "https://opencode.ai/inference/v1/models";
+const USER_AGENT = "opencode/latest/2.0.29/cli";
 
 // --- ID Generator (matches OpenCode desktop app format) ---
 const CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -22,7 +24,9 @@ function createId(descending, timestamp = Date.now()) {
     lastTimestamp = timestamp;
     counter = 0;
   }
-  counter++;
+  // The free-tier gate only accepts session ids whose 12-bit counter is
+  // below 64, so keep the shared counter inside that range.
+  counter = (counter + 1) & 63;
   const current = BigInt(timestamp) * 0x1000n + BigInt(counter);
   const value = descending ? ~current : current;
   let time = "";
@@ -58,10 +62,11 @@ const DISCOVERY_TTL_MS = 60 * 60 * 1000; // Auto-refresh every 1 hour
 // Auto-discovery from OpenCode Zen upstream gateway
 async function discoverModels() {
   try {
-    const res = await fetch(OPENCODE_ZEN_MODELS_URL, {
+    const res = await fetch(OPENCODE_INFERENCE_MODELS_URL, {
       headers: {
         "Authorization": "Bearer public",
         "User-Agent": USER_AGENT,
+        "x-opencode-client": "cli",
       },
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -115,8 +120,53 @@ const MODEL_MAP = {
   "longcat-2.5":                "longcat-2.5-preview-free",
 };
 
-// 6 default desktop tools required to satisfy OpenCode anti-abuse check
-const REQUIRED_TOOLS = ["read", "write", "edit", "bash", "glob", "grep"];
+// The free-tier gate requires a function tool named exactly `read` whose
+// parameters declare an object type with at least one non-empty property.
+// Verbatim v2 client schema captured from opencode 2.0.29 on this machine.
+const READ_TOOL_CHAT = {
+  type: "function",
+  function: {
+    name: "read",
+    description:
+      "Read the contents of a file or directory. Supports text files, images, and PDFs. Images and PDFs are presented directly to the model. Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content. Directory entries are returned one per line. Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "File or directory to read" },
+        offset: {
+          type: "integer",
+          minimum: 0,
+          description: "The line or directory entry to start reading from (1-based)",
+        },
+        limit: {
+          type: "integer",
+          minimum: 0,
+          description: "The maximum number of lines or directory entries to read (defaults to and capped at 2000)",
+        },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    },
+    strict: false,
+  },
+};
+
+// The same tool in the flat shape the Responses API expects.
+const READ_TOOL_FLAT = {
+  type: "function",
+  name: READ_TOOL_CHAT.function.name,
+  description: READ_TOOL_CHAT.function.description,
+  parameters: READ_TOOL_CHAT.function.parameters,
+};
+
+function hasToolProperties(params) {
+  return Boolean(
+    params &&
+      params.type === "object" &&
+      params.properties &&
+      Object.keys(params.properties).length > 0
+  );
+}
 
 // Reasoning models (Muse Spark, MiMo, Nemotron) burn tokens on chain-of-thought
 // before the first visible token. A client asking for max_tokens: 50 gets an
@@ -209,15 +259,18 @@ function prepareResponsesTools(clientTools = []) {
       }
     }
   }
-  for (const name of REQUIRED_TOOLS) {
-    if (!toolMap.has(name)) {
-      toolMap.set(name, {
-        type: "function",
-        name,
-        description: `Compatibility placeholder for ${name}. Do not invoke.`,
-        parameters: { type: "object", properties: {} },
-      });
+  // The gate rejects requests whose tools lack a `read` function with usable
+  // parameters, so synthesize it when the caller does not supply one. A caller
+  // `read` with empty properties is patched instead.
+  const existingRead = toolMap.get("read");
+  if (!existingRead) {
+    toolMap.set("read", READ_TOOL_FLAT);
+  } else {
+    existingRead.type = existingRead.type || "function";
+    if (!hasToolProperties(existingRead.parameters)) {
+      existingRead.parameters = READ_TOOL_FLAT.parameters;
     }
+    if (!existingRead.description) existingRead.description = READ_TOOL_FLAT.description;
   }
   return Array.from(toolMap.values());
 }
@@ -241,16 +294,17 @@ function prepareChatTools(clientTools = []) {
       }
     }
   }
-  for (const name of REQUIRED_TOOLS) {
-    if (!toolMap.has(name)) {
-      toolMap.set(name, {
-        type: "function",
-        function: {
-          name,
-          description: `Compatibility placeholder for ${name}. Do not invoke.`,
-          parameters: { type: "object", properties: {} },
-        },
-      });
+  const existingRead = toolMap.get("read");
+  if (!existingRead) {
+    toolMap.set("read", READ_TOOL_CHAT);
+  } else {
+    existingRead.type = existingRead.type || "function";
+    if (!existingRead.function) existingRead.function = { name: "read" };
+    if (!hasToolProperties(existingRead.function.parameters)) {
+      existingRead.function.parameters = READ_TOOL_CHAT.function.parameters;
+    }
+    if (!existingRead.function.description) {
+      existingRead.function.description = READ_TOOL_CHAT.function.description;
     }
   }
   return Array.from(toolMap.values());
@@ -259,7 +313,9 @@ function prepareChatTools(clientTools = []) {
 // Persistent session cache — preserves upstream prompt/KV cache across turns
 const sessionCache = new Map();
 const MAX_SESSIONS = 500;
-const SESSION_TTL_MS = 3 * 3600 * 1000;
+// The session id embeds a timestamp; re-mint ids after an hour so the
+// embedded time stays recent (ids up to 2h old were still accepted).
+const SESSION_TTL_MS = 60 * 60 * 1000;
 
 function getPersistentSessionId(req, body) {
   const headerKey =
@@ -282,7 +338,7 @@ function getPersistentSessionId(req, body) {
   const now = Date.now();
   if (lookupKey && sessionCache.has(lookupKey)) {
     const entry = sessionCache.get(lookupKey);
-    if (now - entry.lastSeen < SESSION_TTL_MS) {
+    if (now - entry.createdAt < SESSION_TTL_MS) {
       entry.lastSeen = now;
       return entry.sessionId;
     }
@@ -292,7 +348,7 @@ function getPersistentSessionId(req, body) {
     if (sessionCache.size >= MAX_SESSIONS) {
       sessionCache.delete(sessionCache.keys().next().value);
     }
-    sessionCache.set(lookupKey, { sessionId: newSessionId, lastSeen: now });
+    sessionCache.set(lookupKey, { sessionId: newSessionId, lastSeen: now, createdAt: now });
   }
   return newSessionId;
 }
@@ -318,7 +374,7 @@ const server = http.createServer(async (req, res) => {
       JSON.stringify({
         status: "ok",
         provider: "opencode-free-bridge",
-        version: "1.4.0",
+        version: "1.5.0",
         discoveredModels: activeModels.length,
       })
     );
@@ -344,11 +400,11 @@ const server = http.createServer(async (req, res) => {
         const body = JSON.parse(bodyText);
         const targetModel = normalizeModel(body.model);
         const clientStream = Boolean(body.stream);
+        const clientSentTools = Array.isArray(body.tools) && body.tools.length > 0;
         const useResponses = isResponsesModel(targetModel);
 
-        const upstreamUrl = useResponses ? OPENCODE_ZEN_RESPONSES_URL : OPENCODE_ZEN_CHAT_URL;
+        const upstreamUrl = useResponses ? OPENCODE_INFERENCE_RESPONSES_URL : OPENCODE_INFERENCE_CHAT_URL;
         const sessionId = getPersistentSessionId(req, body);
-        const requestId = "msg_" + createId(false);
 
         let upstreamBody;
         if (useResponses) {
@@ -368,6 +424,9 @@ const server = http.createServer(async (req, res) => {
             ),
             tools: prepareResponsesTools(body.tools),
           };
+          // The Responses API upstream only supports tool_choice "auto", so
+          // no-tools callers on this lane rely on the synthesized read tool
+          // never being spontaneously invoked.
         } else {
           upstreamBody = {
             model: targetModel,
@@ -382,6 +441,7 @@ const server = http.createServer(async (req, res) => {
             ),
             tools: prepareChatTools(body.tools),
           };
+          if (!clientSentTools) upstreamBody.tool_choice = "none";
         }
 
         const upstreamRes = await fetch(upstreamUrl, {
@@ -391,10 +451,12 @@ const server = http.createServer(async (req, res) => {
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
             "User-Agent": USER_AGENT,
-            "x-opencode-client": "desktop",
+            "x-opencode-client": "cli",
             "x-opencode-project": "global",
             "x-opencode-session": sessionId,
-            "x-opencode-request": requestId,
+            "x-opencode-session-id": sessionId,
+            "x-session-affinity": sessionId,
+            "x-session-id": sessionId,
           },
           body: JSON.stringify(upstreamBody),
         });

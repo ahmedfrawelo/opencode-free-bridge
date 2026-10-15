@@ -199,7 +199,7 @@ node ~/.opencode-free-bridge/server.js
 ## How it works
 
 ```
-client ──▶ bridge :20129 ──▶ opencode.ai/zen/v1/...
+client ──▶ bridge :20129 ──▶ opencode.ai/inference/v1/...
               │
               ├─ discovers free models hourly
               ├─ routes Muse models to the Responses API
